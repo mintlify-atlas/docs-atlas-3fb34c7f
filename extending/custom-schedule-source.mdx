@@ -1,0 +1,164 @@
+---
+title: "Build a Custom Schedule Source for Taskiq"
+description: "Implement ScheduleSource to feed scheduled tasks from any database or config into the Taskiq scheduler. Covers get_schedules(), ScheduledTask fields, and hooks."
+---
+
+Taskiq's built-in scheduler polls a schedule source on each tick to determine which tasks to dispatch. By subclassing `ScheduleSource` from `taskiq.abc.schedule_source`, you can load scheduled task definitions from a database, a remote API, a config file, or any other system — without changes to task code or the scheduler loop.
+
+## The `ScheduleSource` abstract class
+
+`ScheduleSource` requires one abstract method:
+
+<ParamField path="get_schedules" type="async method" required>
+  Returns a list of `ScheduledTask` objects. The scheduler calls this method on every tick. Return all currently active schedules each time — the scheduler handles cron evaluation and timing.
+</ParamField>
+
+The following methods are optional but useful for richer integrations:
+
+<ParamField path="add_schedule" type="async method">
+  Adds a new schedule to the source (for example, inserts a row into a database). Raises `NotImplementedError` by default.
+</ParamField>
+
+<ParamField path="delete_schedule" type="async method">
+  Deletes a schedule by its `schedule_id`. Raises `NotImplementedError` by default. Implement this to support task cancellation.
+</ParamField>
+
+<ParamField path="pre_send" type="sync or async method">
+  Called just before a scheduled task is dispatched to the broker. May raise `ScheduledTaskCancelledError` to cancel this particular execution.
+</ParamField>
+
+<ParamField path="post_send" type="sync or async method">
+  Called just after a scheduled task is dispatched to the broker.
+</ParamField>
+
+```python
+from abc import abstractmethod
+from taskiq.scheduler.scheduled_task import ScheduledTask
+
+class ScheduleSource(ABC):
+    async def startup(self) -> None: ...
+    async def shutdown(self) -> None: ...
+
+    @abstractmethod
+    async def get_schedules(self) -> list[ScheduledTask]: ...
+
+    async def add_schedule(self, schedule: ScheduledTask) -> None: ...
+    async def delete_schedule(self, schedule_id: str) -> None: ...
+    async def pre_send(self, task: ScheduledTask) -> None: ...
+    async def post_send(self, task: ScheduledTask) -> None: ...
+```
+
+## `ScheduledTask` fields
+
+`ScheduledTask` is the Pydantic model that describes a single scheduled task. At least one of `cron`, `time`, or `interval` must be present.
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `task_name` | `str` | Yes | Fully-qualified task name (`module:function`) |
+| `labels` | `dict[str, Any]` | Yes | Labels to attach to the dispatched message |
+| `args` | `list[Any]` | Yes | Positional arguments for the task function |
+| `kwargs` | `dict[str, Any]` | Yes | Keyword arguments for the task function |
+| `cron` | `str \| None` | No | Cron expression (e.g. `"0 * * * *"` for hourly) |
+| `cron_offset` | `str \| timedelta \| None` | No | Timezone offset applied when evaluating the cron expression |
+| `time` | `datetime \| None` | No | One-shot execution at a specific datetime |
+| `interval` | `int \| timedelta \| None` | No | Repeat every N seconds (int) or timedelta |
+| `task_id` | `str \| None` | No | Override the generated task ID |
+| `schedule_id` | `str` | No | Unique ID for this schedule entry (auto-generated if not set) |
+
+## Complete implementation example
+
+```python schedule_source.py
+from taskiq import ScheduledTask, ScheduleSource
+
+
+class MyScheduleSource(ScheduleSource):
+    async def startup(self) -> None:
+        """Open database connection or load config."""
+
+    async def shutdown(self) -> None:
+        """Close database connection."""
+
+    async def get_schedules(self) -> list["ScheduledTask"]:
+        # Return all currently active schedules.
+        # The scheduler evaluates cron/interval/time on each tick.
+        return [
+            ScheduledTask(
+                task_name="my_module:my_task",
+                labels={},
+                args=[],
+                kwargs={},
+                cron="* * * * *",
+            ),
+        ]
+
+    # Optional: allows callers to register new schedules at runtime.
+    async def add_schedule(self, schedule: "ScheduledTask") -> None:
+        print("New schedule added:", schedule)
+
+    # Optional: allows callers to cancel scheduled tasks.
+    async def delete_schedule(self, schedule_id: str) -> None:
+        print("Deleting schedule:", schedule_id)
+
+    # Optional: called before each dispatch. Raise ScheduledTaskCancelledError
+    # to skip this execution without removing the schedule.
+    async def pre_send(self, task: "ScheduledTask") -> None:
+        """Actions to execute before task will be sent to broker."""
+
+    # Optional: called after each successful dispatch.
+    async def post_send(self, task: "ScheduledTask") -> None:
+        """Actions to execute after task was sent to broker."""
+```
+
+## Registering with `TaskiqScheduler`
+
+Pass your source (or a list of sources) to `TaskiqScheduler`:
+
+```python
+from taskiq.scheduler import TaskiqScheduler
+from my_package.sources import MyScheduleSource
+
+scheduler = TaskiqScheduler(
+    broker=broker,
+    sources=[MyScheduleSource()],
+)
+```
+
+Start the scheduler from the CLI:
+
+```bash
+taskiq scheduler my_module:scheduler
+```
+
+<Note>
+  You can provide multiple sources to `TaskiqScheduler`. The scheduler merges the schedules returned by all sources on each tick.
+</Note>
+
+## Using `LabelScheduleSource` as a base
+
+If you want to derive schedules from task labels (the `schedule` label set when decorating a task) rather than an external store, use `LabelScheduleSource` as your base class instead of `ScheduleSource`. It handles label parsing and lets you focus on any additional filtering or storage logic.
+
+```python
+from taskiq.schedule_sources import LabelScheduleSource
+
+class MyFilteredLabelSource(LabelScheduleSource):
+    async def get_schedules(self) -> list[ScheduledTask]:
+        all_schedules = await super().get_schedules()
+        # Filter or augment the label-derived schedules.
+        return [s for s in all_schedules if s.labels.get("enabled", True)]
+```
+
+## Cancelling a scheduled execution
+
+To cancel a single execution (without removing the schedule), raise `ScheduledTaskCancelledError` inside `pre_send()`:
+
+```python
+from taskiq.exceptions import ScheduledTaskCancelledError
+
+async def pre_send(self, task: ScheduledTask) -> None:
+    if await self.is_paused(task.schedule_id):
+        raise ScheduledTaskCancelledError()
+```
+
+<Tip>
+  Use `pre_send()` for runtime gating (feature flags, maintenance windows) and `delete_schedule()` for permanent cancellation.
+</Tip>

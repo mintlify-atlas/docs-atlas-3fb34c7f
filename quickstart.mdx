@@ -1,80 +1,268 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+title: "Quickstart: Send Your First taskiq Task in Minutes"
+description: "Install taskiq, define a task with the @broker.task decorator, send it with .kiq(), and read the result — then swap in a production-ready RabbitMQ broker."
 ---
 
-## Get started in three steps
+This page walks you from a working local example using `InMemoryBroker` all the way to a distributed setup with RabbitMQ and a Redis result backend. Every code snippet is a real, runnable file — no placeholders.
 
-Get your documentation site running locally and make your first customization.
+<Steps>
 
-### Step 1: Set up your local environment
+<Step title="Install taskiq">
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
+Install the core package from PyPI:
 
-### Step 2: Deploy your changes
+<Tabs>
+  <Tab title="pip">
+    ```bash
+    pip install taskiq
+    ```
+  </Tab>
+  <Tab title="uv">
+    ```bash
+    uv add taskiq
+    ```
+  </Tab>
+  <Tab title="poetry">
+    ```bash
+    poetry add taskiq
+    ```
+  </Tab>
+</Tabs>
 
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+The core package includes `InMemoryBroker` for local development. You don't need any external services to run the next step.
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+</Step>
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+<Step title="Write and run your first task">
 
-### Step 3: Go live
+Create a file called `broker.py` with the following contents:
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+```python
+# broker.py
+import asyncio
 
-## Next steps
+from taskiq import InMemoryBroker
 
-Now that you have your docs running, explore these key features:
+broker = InMemoryBroker()
 
-<CardGroup cols={2}>
 
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
+@broker.task
+async def add_one(value: int) -> int:
+    return value + 1
 
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
 
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
+async def main() -> None:
+    # Never forget to call startup in the beginning.
+    await broker.startup()
+    # Send the task to the broker.
+    task = await add_one.kiq(1)
+    # Wait for the result.
+    result = await task.wait_result(timeout=2)
+    print(f"Task execution took: {result.execution_time} seconds.")
+    if not result.is_err:
+        print(f"Returned value: {result.return_value}")
+    else:
+        print("Error found while executing task.")
+    await broker.shutdown()
 
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
 
-</CardGroup>
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+Run it:
+
+```bash
+python broker.py
+```
+
+Expected output:
+
+```
+Task execution took: 7.3909759521484375e-06 seconds.
+Returned value: 2
+```
 
 <Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
+`InMemoryBroker` executes tasks in the same process as the caller. It is useful for development and testing but does not send any data over the network. You cannot use it to run tasks in a separate worker process.
 </Note>
+
+**What just happened?**
+
+- `@broker.task` registers `add_one` as a task and returns an `AsyncTaskiqDecoratedTask` object.
+- `.kiq(1)` assembles a message with the argument `1` and sends it. It returns an `AsyncTaskiqTask` with a `task_id`.
+- `.wait_result(timeout=2)` polls the result backend until the result is ready, then returns a `TaskiqResult`.
+- `result.is_err` is `False` when the task completed without raising an exception. `result.return_value` holds the return value.
+
+<Warning>
+Always call `await broker.startup()` before sending any tasks. Skipping this can cause undefined behavior, especially with brokers that need to establish a network connection.
+</Warning>
+
+</Step>
+
+<Step title="Switch to a distributed broker">
+
+`InMemoryBroker` is not suitable for production. The following example replaces it with `AioPikaBroker` (RabbitMQ) and adds a Redis result backend so results survive across processes.
+
+Install the additional packages:
+
+```bash
+pip install taskiq-aio-pika taskiq-redis
+```
+
+Start RabbitMQ and Redis with Docker:
+
+<Tabs>
+  <Tab title="Linux / macOS">
+    ```bash
+    docker run --rm -d \
+        -p "5672:5672" \
+        -p "15672:15672" \
+        --env "RABBITMQ_DEFAULT_USER=guest" \
+        --env "RABBITMQ_DEFAULT_PASS=guest" \
+        --env "RABBITMQ_DEFAULT_VHOST=/" \
+        rabbitmq:3.8.27-management-alpine
+
+    docker run --rm -d \
+        -p "6379:6379" \
+        redis
+    ```
+  </Tab>
+  <Tab title="Windows">
+    ```powershell
+    docker run --rm -d ^
+        -p "5672:5672" ^
+        -p "15672:15672" ^
+        --env "RABBITMQ_DEFAULT_USER=guest" ^
+        --env "RABBITMQ_DEFAULT_PASS=guest" ^
+        --env "RABBITMQ_DEFAULT_VHOST=/" ^
+        rabbitmq:3.8.27-management-alpine
+
+    docker run --rm -d ^
+        -p "6379:6379" ^
+        redis
+    ```
+  </Tab>
+</Tabs>
+
+Update `broker.py` to use the distributed broker and result backend:
+
+```python
+# broker.py
+import asyncio
+
+from taskiq_aio_pika import AioPikaBroker
+from taskiq_redis import RedisAsyncResultBackend
+
+broker = AioPikaBroker(
+    "amqp://guest:guest@localhost:5672",
+).with_result_backend(RedisAsyncResultBackend("redis://localhost"))
+
+
+@broker.task
+async def add_one(value: int) -> int:
+    return value + 1
+
+
+async def main() -> None:
+    await broker.startup()
+    # Send the task to the broker.
+    task = await add_one.kiq(1)
+    # Wait for the result.
+    result = await task.wait_result(timeout=2)
+    print(f"Task execution took: {result.execution_time} seconds.")
+    if not result.is_err:
+        print(f"Returned value: {result.return_value}")
+    else:
+        print("Error found while executing task.")
+    await broker.shutdown()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+<Tip>
+For production, `taskiq-aio-pika` (RabbitMQ) or `taskiq-nats` are recommended as the broker, and `taskiq-redis` as the result backend. Check PyPI for the full list of available broker packages by searching `taskiq`.
+</Tip>
+
+</Step>
+
+<Step title="Start the worker process">
+
+With a distributed broker, tasks are executed by a separate worker process. Start one with the `taskiq worker` CLI command, pointing it at the module and variable name of your broker:
+
+```bash
+taskiq worker broker:broker
+```
+
+The format is `module_path:variable_name`. Here `broker` is both the filename (`broker.py`) and the variable name inside it.
+
+If your tasks are spread across multiple modules, you can either list them explicitly or use `--fs-discover` to auto-import all `tasks.py` files recursively:
+
+```bash
+# Explicit imports
+taskiq worker myproject.broker:broker myproject.tasks myproject.jobs
+
+# Auto-discover all tasks.py files
+taskiq worker myproject.broker:broker --fs-discover
+```
+
+For hot-reloading during development, install the `reload` extra and pass `--reload`:
+
+```bash
+pip install "taskiq[reload]"
+taskiq worker broker:broker --reload
+```
+
+</Step>
+
+<Step title="Send a task and check the result">
+
+With the worker running in one terminal, run the client script in another:
+
+```bash
+python broker.py
+```
+
+Expected output:
+
+```
+Task execution took: 1.0013580322265625e-05 seconds.
+Returned value: 2
+```
+
+The `main()` function sends the task via RabbitMQ, the worker picks it up and executes it, stores the result in Redis, and then `.wait_result()` fetches it back.
+
+</Step>
+
+</Steps>
+
+## Setting task timeouts
+
+You can restrict how long a task is allowed to run by adding a `timeout` label. This works both on the decorator and at call time:
+
+<Tabs>
+  <Tab title="Via decorator">
+    ```python
+    import asyncio
+
+    @broker.task(timeout=0.1)
+    async def slow_task() -> None:
+        await asyncio.sleep(2)
+    ```
+  </Tab>
+  <Tab title="Via kicker at call time">
+    ```python
+    await slow_task.kicker().with_labels(timeout=0.3).kiq()
+    ```
+  </Tab>
+</Tabs>
+
+<Warning>
+Timeouts raise `TimeoutError` for async tasks. For synchronous tasks run via `run_in_executor`, Python cannot forcibly stop execution, so the timeout will raise but the function may continue running in the background.
+</Warning>
+
+## What's next
+
+Now that you have a working setup, read the [architecture overview](/architecture) to understand how brokers, kickers, result backends, workers, and middlewares connect — and how to extend each one.

@@ -1,0 +1,137 @@
+---
+title: "Using Taskiq with Aiogram"
+description: "Offload slow or CPU-intensive Telegram bot operations to taskiq background tasks and inject bot and dispatcher instances as dependencies."
+---
+
+**taskiq-aiogram** integrates taskiq with [aiogram](https://docs.aiogram.dev/en/latest/), a popular async Telegram bot framework. It lets you dispatch heavy operations — image processing, external API calls, long database queries — to background workers instead of blocking your bot's message handler, and it injects bot and dispatcher instances directly into your task functions.
+
+## Injected dependencies
+
+The integration registers three dependencies you can use in any task:
+
+| Type | Description |
+|---|---|
+| `aiogram.Bot` | The bot instance. When multiple bots are registered, resolves to the last bot passed to `taskiq_aiogram.init`. |
+| `aiogram.Dispatcher` | The current dispatcher instance. |
+| `List[aiogram.Bot]` | All bots passed to `taskiq_aiogram.init`, in order. |
+
+## Setup
+
+<Steps>
+  <Step title="Install taskiq-aiogram">
+    ```bash
+    pip install "taskiq-aiogram"
+    ```
+  </Step>
+
+  <Step title="Create your broker file and initialize the integration">
+    Call `taskiq_aiogram.init` with your broker, the dotted path to your dispatcher, and the dotted path to your bot. You can pass additional bot paths to register multiple bots.
+
+    ```python title="tkq.py"
+    import asyncio
+
+    import taskiq_aiogram
+    from aiogram import Bot
+    from taskiq import TaskiqDepends
+    from taskiq_redis import ListQueueBroker
+
+    broker = ListQueueBroker("redis://localhost")
+
+    # Initialize the integration with the broker, dispatcher path, and bot path.
+    taskiq_aiogram.init(
+        broker,
+        # Path to the dispatcher variable.
+        "bot:dp",
+        # Path to the bot instance.
+        "bot:bot",
+        # You can add more bots here.
+    )
+
+
+    @broker.task(task_name="my_task")
+    async def my_task(chat_id: int, bot: Bot = TaskiqDepends()) -> None:
+        print("I'm a task")
+        await asyncio.sleep(4)
+        await bot.send_message(chat_id, "task completed")
+    ```
+  </Step>
+
+  <Step title="Register broker startup and shutdown in your bot">
+    Use aiogram's `@dp.startup()` and `@dp.shutdown()` decorators to connect the broker lifecycle to your bot's lifecycle. Guard each call with `broker.is_worker_process` to avoid an infinite startup loop.
+
+    ```python title="bot.py"
+    import asyncio
+    import logging
+    import sys
+
+    from aiogram import Bot, Dispatcher, types
+    from aiogram.filters import Command
+
+    from tkq import broker, my_task
+
+    dp = Dispatcher()
+    bot = Bot(token="TOKEN")
+
+
+    @dp.startup()
+    async def setup_taskiq(bot: Bot, *_args, **_kwargs):
+        # Only start the broker on the client side (the bot process).
+        # Without this guard, the worker would trigger its own startup again,
+        # creating an infinite loop.
+        if not broker.is_worker_process:
+            logging.info("Setting up taskiq")
+            await broker.startup()
+
+
+    @dp.shutdown()
+    async def shutdown_taskiq(bot: Bot, *_args, **_kwargs):
+        if not broker.is_worker_process:
+            logging.info("Shutting down taskiq")
+            await broker.shutdown()
+
+
+    @dp.message(Command("task"))
+    async def message(message: types.Message):
+        # Dispatch the task to the worker and return immediately.
+        await my_task.kiq(message.chat.id)
+
+
+    async def main():
+        await dp.start_polling(bot)
+
+
+    if __name__ == "__main__":
+        logging.basicConfig(level=logging.INFO, stream=sys.stdout)
+        asyncio.run(main())
+    ```
+  </Step>
+</Steps>
+
+## How it works
+
+When a user sends a `/task` command, the handler calls `my_task.kiq(message.chat.id)`, which publishes a message to the broker's queue and returns immediately. The taskiq worker process picks up the message, resolves the `Bot` dependency from the integration, waits four seconds, and sends a reply to the chat. The bot handler is never blocked.
+
+<Note>
+  The `is_worker_process` flag is `False` by default on every broker instance. Taskiq's worker process sets it to `True` before calling `broker.startup()`. Always check this flag before calling startup or shutdown in framework lifecycle hooks.
+</Note>
+
+## Running the worker
+
+Start the taskiq worker separately from your bot process:
+
+```bash
+taskiq worker tkq:broker
+```
+
+The bot process and the worker process communicate through the broker (Redis in the example above). The bot enqueues tasks; the worker executes them.
+
+## Further reading
+
+<CardGroup cols={2}>
+  <Card title="taskiq-aiogram on GitHub" icon="github" href="https://github.com/taskiq-python/taskiq-aiogram">
+    Source code and release notes for the aiogram integration.
+  </Card>
+  <Card title="aiogram documentation" icon="book-open" href="https://docs.aiogram.dev/en/latest/">
+    Official aiogram documentation covering bots, dispatchers, and filters.
+  </Card>
+</CardGroup>

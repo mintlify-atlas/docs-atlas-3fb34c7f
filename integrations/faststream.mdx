@@ -1,0 +1,83 @@
+---
+title: "Using Taskiq with FastStream"
+description: "Wrap a FastStream broker with BrokerWrapper to use FastStream as a taskiq transport and unlock taskiq's scheduler alongside FastStream's event system."
+---
+
+[FastStream](https://faststream.ag2.ai/latest/) is a Python framework for building producers and consumers on top of distributed message brokers (Kafka, RabbitMQ, NATS, and others). Taskiq and FastStream address different problems: taskiq is focused on background task execution within a single project (similar to Celery but async), while FastStream is focused on defining event-driven communication between independent services. Despite these different goals, the two libraries integrate cleanly — FastStream can act as the transport layer for taskiq, which lets you use taskiq's scheduler on top of any broker that FastStream supports.
+
+## Installation
+
+```bash
+pip install "taskiq-faststream"
+```
+
+## Usage
+
+Wrap your FastStream broker with `BrokerWrapper` to expose it as a taskiq broker:
+
+```python
+from faststream import FastStream
+from faststream.kafka import KafkaBroker
+from taskiq_faststream import BrokerWrapper
+
+broker = KafkaBroker("localhost:9092")
+app = FastStream(broker)
+
+taskiq_broker = BrokerWrapper(broker)
+```
+
+`taskiq_broker` is a standard taskiq `AsyncBroker`. You can use it to define tasks with `@taskiq_broker.task` and schedule them with taskiq's built-in scheduler, while FastStream continues to manage the underlying Kafka connection and any FastStream subscribers you define on the same `broker` instance.
+
+<Note>
+  The `BrokerWrapper` delegates message transport to FastStream. You still configure connection details (bootstrap servers, topics, etc.) on the FastStream broker — `BrokerWrapper` only adds the taskiq task-dispatch interface on top.
+</Note>
+
+## When to use this integration
+
+<CardGroup cols={2}>
+  <Card title="Use taskiq-faststream when..." icon="check">
+    You already use FastStream for inter-service messaging and want to add scheduled or delayed background tasks without introducing a second message broker.
+  </Card>
+  <Card title="Use taskiq standalone when..." icon="square">
+    Your background tasks are internal to one service and you do not need FastStream's event-routing or cross-service communication features.
+  </Card>
+</CardGroup>
+
+## Scheduling tasks
+
+Because `taskiq_broker` is a standard taskiq broker, you can attach taskiq's scheduler to it directly:
+
+```python
+from taskiq import TaskiqScheduler
+from taskiq.schedule_sources import LabelScheduleSource
+from taskiq_faststream import BrokerWrapper
+from faststream.kafka import KafkaBroker
+
+kafka = KafkaBroker("localhost:9092")
+taskiq_broker = BrokerWrapper(kafka)
+
+scheduler = TaskiqScheduler(
+    broker=taskiq_broker,
+    sources=[LabelScheduleSource(taskiq_broker)],
+)
+
+
+@taskiq_broker.task(schedule=[{"cron": "*/5 * * * *"}])
+async def periodic_task() -> None:
+    print("runs every 5 minutes")
+```
+
+<Tip>
+  See the [FastStream scheduling documentation](https://faststream.ag2.ai/latest/scheduling/) for additional examples of combining the two libraries.
+</Tip>
+
+## Further reading
+
+<CardGroup cols={2}>
+  <Card title="FastStream documentation" icon="book-open" href="https://faststream.ag2.ai/latest/">
+    Full FastStream docs covering brokers, subscribers, publishers, and testing.
+  </Card>
+  <Card title="FastStream scheduling guide" icon="clock" href="https://faststream.ag2.ai/latest/scheduling/">
+    Step-by-step guide for scheduling tasks with FastStream and taskiq together.
+  </Card>
+</CardGroup>

@@ -1,0 +1,234 @@
+---
+title: "Result backends for storing taskiq task output"
+description: "How taskiq result backends work, built-in DummyResultBackend and InMemoryResultBackend options, and how to retrieve results with wait_result and get_result."
+---
+
+A **result backend** in taskiq stores the outcome of every task execution — the return value, execution time, error state, and optional logs. When a worker finishes a task it calls `set_result()`; client code calls `get_result()` or `wait_result()` to retrieve it. Without a real backend configured, results are discarded silently.
+
+## The TaskiqResult structure
+
+Every result backend stores and returns a `TaskiqResult` object. Understanding its fields helps you handle successes and failures correctly.
+
+```python
+from taskiq import TaskiqResult
+
+# TaskiqResult fields:
+#   is_err: bool            – True if the task raised an exception
+#   return_value: T         – the value returned by the task function
+#   execution_time: float   – wall-clock seconds the task took
+#   error: BaseException | None  – the caught exception, if any
+#   log: str | None         – deprecated; may be None
+#   labels: dict[str, Any]  – labels that were on the task message
+```
+
+Call `.raise_for_error()` to re-raise the stored exception if `is_err` is `True`:
+
+```python
+result = await task.get_result()
+result.raise_for_error()   # raises if the task failed
+print(result.return_value)
+```
+
+---
+
+## Built-in result backends
+
+### DummyResultBackend
+
+`DummyResultBackend` is the default when no backend is configured. It does nothing: `set_result()` is a no-op, `is_result_ready()` always returns `True`, and `get_result()` returns a dummy `TaskiqResult` with `return_value=None` and `is_err=False`.
+
+<Warning>
+`DummyResultBackend` emits a `UserWarning` every time `get_result()` is called: *"No result backend configured. Returning dummy result..."*. If your code reads task results, you must attach a real backend.
+</Warning>
+
+```python
+from taskiq.result_backends.dummy import DummyResultBackend
+
+# This is the default — you don't need to set it explicitly.
+# Calling get_result() always returns None for return_value.
+backend = DummyResultBackend()
+```
+
+### InmemoryResultBackend
+
+`InmemoryResultBackend` is bundled with `InMemoryBroker` and used automatically when you create that broker. It keeps results in an `OrderedDict` in the current process. When the number of stored results exceeds `max_stored_results`, the oldest entry is evicted (LRU behaviour).
+
+```python
+from taskiq.brokers.inmemory_broker import InmemoryResultBackend
+
+backend = InmemoryResultBackend(max_stored_results=100)
+```
+
+<Note>
+Set `max_stored_results=-1` to disable eviction and keep all results for the lifetime of the process. Only do this in tests where you control the number of tasks.
+</Note>
+
+This backend is **in-process only**. Results are not shared between processes and are lost when the interpreter exits.
+
+---
+
+## Attaching a result backend to a broker
+
+Use `.with_result_backend()` on any broker to attach a backend. The method returns the same broker instance, so it can be chained:
+
+```python
+from taskiq import ZeroMQBroker
+from taskiq_redis import RedisAsyncResultBackend
+
+broker = ZeroMQBroker().with_result_backend(
+    RedisAsyncResultBackend("redis://localhost:6379/0"),
+)
+```
+
+---
+
+## Retrieving results
+
+After sending a task with `.kiq()`, you receive an `AsyncTaskiqTask` handle. Use it to poll or wait for the result.
+
+### wait_result
+
+`wait_result()` polls `is_result_ready()` on an interval until the result is available or the timeout expires.
+
+```python
+task = await my_task.kiq(arg1, arg2)
+
+# Wait up to 30 seconds, checking every 0.5 s
+result = await task.wait_result(check_interval=0.5, timeout=30.0)
+print(result.return_value)
+print(result.execution_time)
+```
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `check_interval` | `float` | `0.2` | Seconds between readiness checks. |
+| `timeout` | `float` | `-1.0` | Maximum seconds to wait. `-1` means no timeout. |
+| `with_logs` | `bool` | `False` | Pass `True` to request worker logs if supported. |
+
+Raises `TaskiqResultTimeoutError` if the task is not ready within `timeout` seconds.
+
+### get_result
+
+`get_result()` fetches the result immediately without waiting. It raises `ResultGetError` if the result is not yet available or the backend fails.
+
+```python
+task = await my_task.kiq()
+# ... do other work ...
+if await task.is_ready():
+    result = await task.get_result()
+```
+
+### is_ready
+
+`is_ready()` returns `True` when the backend has a result stored for this task ID. Raises `ResultIsReadyError` if the backend itself fails.
+
+---
+
+## Error handling
+
+```python
+from taskiq import NoResultError, ResultIsReadyError, TaskiqResultTimeoutError
+
+task = await my_task.kiq()
+
+try:
+    result = await task.wait_result(timeout=10.0)
+except TaskiqResultTimeoutError:
+    print("Task did not finish in time")
+
+if result.is_err:
+    print(f"Task failed: {result.error}")
+else:
+    print(f"Return value: {result.return_value}")
+```
+
+| Exception | When raised |
+|---|---|
+| `TaskiqResultTimeoutError` | `wait_result()` timed out before the result was ready. |
+| `ResultGetError` | `get_result()` could not retrieve the result from the backend. |
+| `ResultIsReadyError` | `is_ready()` could not query the backend. |
+| `NoResultError` | A retry middleware replaced the result with a sentinel to signal that no result should be stored. |
+
+### Awaiting multiple tasks with `gather`
+
+To wait for multiple tasks at once, use the `gather` helper from `taskiq`. It is analogous to `asyncio.gather` but works with `AsyncTaskiqTask` handles:
+
+```python
+from taskiq import gather
+
+task1 = await my_task.kiq(1)
+task2 = await my_task.kiq(2)
+task3 = await my_task.kiq(3)
+
+# Wait for all three tasks; returns a tuple of TaskiqResult in order
+results = await gather(task1, task2, task3, timeout=30.0)
+for result in results:
+    print(result.return_value)
+```
+
+**Parameters:**
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `*tasks` | `AsyncTaskiqTask` | required | One or more task handles to wait for. |
+| `timeout` | `float` | `-1` | Maximum seconds to wait. `-1` means no timeout. |
+| `with_logs` | `bool` | `False` | Whether to fetch worker logs alongside results. |
+| `periodicity` | `float` | `0.1` | Polling interval in seconds. |
+
+`gather` raises `TaskiqResultTimeoutError` if the timeout expires before all results are ready. Results are returned as a `tuple` in the same order the tasks were passed.
+
+---
+
+## Official ecosystem backends
+
+These backends are maintained by the taskiq team.
+
+<CardGroup cols={2}>
+  <Card title="Redis result backend" icon="database" href="https://github.com/taskiq-python/taskiq-redis">
+    `RedisAsyncResultBackend` from `taskiq-redis`. Stores results as JSON-serialized keys with optional TTL.
+  </Card>
+  <Card title="NATS result backend" icon="bolt" href="https://github.com/taskiq-python/taskiq-nats">
+    Key-value result backend from `taskiq-nats`.
+  </Card>
+</CardGroup>
+
+<Tabs>
+  <Tab title="Redis">
+    ```bash
+    pip install taskiq-redis
+    ```
+  </Tab>
+  <Tab title="NATS">
+    ```bash
+    pip install taskiq-nats
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## Third-party backends
+
+<AccordionGroup>
+  <Accordion title="PostgreSQL — taskiq-postgresql">
+    Project link: [taskiq-postgresql](https://github.com/z22092/taskiq-postgresql)
+
+    ```bash
+    pip install taskiq-postgresql
+    ```
+  </Accordion>
+  <Accordion title="S3 — taskiq-aio-sqs">
+    Project link: [taskiq-aio-sqs](https://github.com/vonsteer/taskiq-aio-sqs)
+
+    ```bash
+    pip install taskiq-aio-sqs
+    ```
+  </Accordion>
+  <Accordion title="YDB — taskiq-ydb">
+    Project link: [taskiq-ydb](https://github.com/danfimov/taskiq-ydb)
+
+    ```bash
+    pip install taskiq-ydb
+    ```
+  </Accordion>
+</AccordionGroup>

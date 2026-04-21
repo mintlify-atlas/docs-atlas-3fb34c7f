@@ -1,0 +1,176 @@
+---
+title: "Build a Custom Result Backend for Taskiq"
+description: "Implement AsyncResultBackend to persist task results in any storage. Covers set_result(), get_result(), is_result_ready(), and the TaskiqResult model fields."
+---
+
+Taskiq stores task results in a result backend so that the code that dispatched a task can later retrieve its return value, execution time, and any errors. By subclassing `AsyncResultBackend` from `taskiq.abc.result_backend`, you can persist results in any storage system — PostgreSQL, MongoDB, DynamoDB, an in-memory cache, or anything else your application already uses.
+
+## The `AsyncResultBackend` abstract class
+
+`AsyncResultBackend` is a generic class parameterised by the task's return type. It requires three abstract methods:
+
+<ParamField path="set_result" type="async method" required>
+  Persists a `TaskiqResult` to storage, keyed by `task_id`. Called by the worker after a task completes (successfully or not).
+</ParamField>
+
+<ParamField path="is_result_ready" type="async method" required>
+  Returns `True` if a result for the given `task_id` already exists in storage. Should check existence only — do not fetch the full result.
+</ParamField>
+
+<ParamField path="get_result" type="async method" required>
+  Retrieves and returns the `TaskiqResult` for a given `task_id`. The `with_logs` parameter controls whether task logs are included in the response.
+</ParamField>
+
+```python
+from abc import abstractmethod
+from typing import Generic, TypeVar
+from taskiq.result import TaskiqResult
+
+_ReturnType = TypeVar("_ReturnType")
+
+class AsyncResultBackend(ABC, Generic[_ReturnType]):
+    async def startup(self) -> None: ...
+    async def shutdown(self) -> None: ...
+
+    @abstractmethod
+    async def set_result(
+        self,
+        task_id: str,
+        result: TaskiqResult[_ReturnType],
+    ) -> None: ...
+
+    @abstractmethod
+    async def is_result_ready(self, task_id: str) -> bool: ...
+
+    @abstractmethod
+    async def get_result(
+        self,
+        task_id: str,
+        with_logs: bool = False,
+    ) -> TaskiqResult[_ReturnType]: ...
+```
+
+## `TaskiqResult` fields
+
+`TaskiqResult` is the Pydantic model you receive in `set_result()` and must return from `get_result()`.
+
+| Field | Type | Description |
+|---|---|---|
+| `is_err` | `bool` | `True` if the task raised an exception |
+| `return_value` | `_ReturnType` | The value returned by the task function (or the exception if `is_err` is `True`) |
+| `execution_time` | `float` | How long the task took to run, in seconds |
+| `labels` | `dict[str, Any]` | Labels that were attached to the task message |
+| `error` | `BaseException \| None` | The exception instance if `is_err` is `True`, otherwise `None` |
+| `log` | `str \| None` | Captured log output (deprecated — will be removed in a future release) |
+
+## Complete implementation example
+
+```python result_backend.py
+from typing import TypeVar
+
+from taskiq import TaskiqResult
+from taskiq.abc.result_backend import AsyncResultBackend
+
+_ReturnType = TypeVar("_ReturnType")
+
+
+class MyResultBackend(AsyncResultBackend[_ReturnType]):
+    async def startup(self) -> None:
+        """Open database connections or initialise the storage client."""
+
+    async def shutdown(self) -> None:
+        """Close connections and release resources."""
+
+    async def set_result(
+        self,
+        task_id: str,
+        result: TaskiqResult[_ReturnType],
+    ) -> None:
+        """
+        Persist the task result.
+
+        Serialise `result` and write it to storage under the key `task_id`.
+        The result must be retrievable later by get_result().
+        """
+
+    async def get_result(
+        self,
+        task_id: str,
+        with_logs: bool = False,
+    ) -> TaskiqResult[_ReturnType]:
+        """
+        Retrieve a previously stored result.
+
+        When with_logs is False, you may omit the log field from the
+        fetched data to reduce network and memory overhead.
+        """
+        return ...  # type: ignore
+
+    async def is_result_ready(
+        self,
+        task_id: str,
+    ) -> bool:
+        """
+        Check whether a result has been saved for this task_id.
+
+        Do not fetch the full result — check existence only.
+        """
+        return ...  # type: ignore
+```
+
+## Handling logs
+
+<Note>
+  The `with_logs` parameter exists for backward compatibility. It is best practice to skip fetching log data unless `with_logs=True` is explicitly set, since log strings can be large and callers usually do not need them.
+</Note>
+
+```python
+async def get_result(
+    self,
+    task_id: str,
+    with_logs: bool = False,
+) -> TaskiqResult[_ReturnType]:
+    row = await self.db.fetch_one(
+        "SELECT * FROM task_results WHERE task_id = $1", task_id
+    )
+    result = deserialise(row)
+    if not with_logs:
+        result.log = None
+    return result
+```
+
+<Warning>
+  The `with_logs` parameter is deprecated and will be removed in a future release of Taskiq. New implementations should store log data alongside the result but do not need to treat it specially.
+</Warning>
+
+## Optional: progress tracking
+
+`AsyncResultBackend` also exposes two optional methods for progress reporting. You do not need to implement them, but doing so enables `TaskProgress` updates from inside task functions:
+
+```python
+from taskiq.depends.progress_tracker import TaskProgress
+from typing import Any
+
+async def set_progress(self, task_id: str, progress: TaskProgress[Any]) -> None:
+    """Save intermediate progress for a running task."""
+
+async def get_progress(self, task_id: str) -> TaskProgress[Any] | None:
+    """Retrieve the latest progress for a running task."""
+```
+
+## Attaching to a broker
+
+Use `with_result_backend()` to attach your backend to a broker:
+
+```python
+from taskiq_redis import ListQueueBroker
+
+broker = (
+    ListQueueBroker("redis://localhost")
+    .with_result_backend(MyResultBackend())
+)
+```
+
+<Tip>
+  When you call `broker.startup()`, the result backend's `startup()` is called automatically. Similarly, `shutdown()` is called when the broker shuts down. You do not need to manage the backend lifecycle separately.
+</Tip>

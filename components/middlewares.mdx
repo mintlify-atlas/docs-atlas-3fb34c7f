@@ -1,0 +1,244 @@
+---
+title: "Built-in middlewares for taskiq task execution"
+description: "How taskiq middlewares work and how to configure SimpleRetryMiddleware, SmartRetryMiddleware, PrometheusMiddleware, and OpenTelemetry instrumentation."
+---
+
+Taskiq **middlewares** hook into the task execution lifecycle. Each middleware can react to events such as task receipt (`pre_execute`), task completion (`post_execute`), result storage (`post_save`), and errors (`on_error`). You attach middlewares to a broker with `.with_middlewares()`, and every worker that uses that broker runs them automatically.
+
+## Attaching middlewares to a broker
+
+`.with_middlewares()` accepts one or more middleware instances and returns the broker so you can chain calls:
+
+```python
+from taskiq import ZeroMQBroker, SimpleRetryMiddleware
+
+broker = ZeroMQBroker().with_middlewares(
+    SimpleRetryMiddleware(default_retry_count=3),
+)
+```
+
+All built-in middlewares are importable from the top-level `taskiq` package as well as from `taskiq.middlewares`:
+
+```python
+from taskiq import SimpleRetryMiddleware, SmartRetryMiddleware, PrometheusMiddleware
+# or
+from taskiq.middlewares import SimpleRetryMiddleware, SmartRetryMiddleware, PrometheusMiddleware
+```
+
+---
+
+## SimpleRetryMiddleware
+
+`SimpleRetryMiddleware` re-enqueues a task with its original arguments whenever an unhandled exception escapes the task function. The task is re-sent up to `max_retries` times using the same task ID and labels.
+
+```python
+from taskiq import ZeroMQBroker, SimpleRetryMiddleware
+
+broker = ZeroMQBroker().with_middlewares(
+    SimpleRetryMiddleware(default_retry_count=3),
+)
+```
+
+**Constructor parameters:**
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `default_retry_count` | `int` | `3` | Maximum retries if not overridden by the task label. |
+| `default_retry_label` | `bool` | `False` | Retry all tasks by default even without the `retry_on_error` label. |
+| `no_result_on_retry` | `bool` | `True` | Replace the result with `NoResultError` while a retry is pending. |
+| `types_of_exceptions` | `Iterable[type[BaseException]] \| None` | `None` | Only retry on these exception types. Retries all exceptions if `None`. |
+
+**Enabling retries on individual tasks:**
+
+```python
+@broker.task(retry_on_error=True, max_retries=20)
+async def fragile_task() -> None:
+    raise Exception("something went wrong")
+```
+
+- `retry_on_error=True` — opt this task into retry behaviour.
+- `max_retries=20` — override the middleware's `default_retry_count` for this task.
+
+<Note>
+Retries reuse the same `task_id`. The internal `_retries` label is incremented on each attempt so the middleware knows when the limit is reached.
+</Note>
+
+---
+
+## SmartRetryMiddleware
+
+`SmartRetryMiddleware` extends the basic retry pattern with configurable delay, optional jitter, and exponential backoff. It is especially useful when tasks fail due to transient network errors or temporarily unavailable external services.
+
+```python
+from taskiq import ZeroMQBroker
+from taskiq.middlewares import SmartRetryMiddleware
+
+broker = ZeroMQBroker().with_middlewares(
+    SmartRetryMiddleware(
+        default_retry_count=5,
+        default_delay=10,
+        use_jitter=True,
+        use_delay_exponent=True,
+        max_delay_exponent=120,
+    ),
+)
+```
+
+**Constructor parameters:**
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `default_retry_count` | `int` | `3` | Maximum retries if the task label does not specify `max_retries`. |
+| `default_retry_label` | `bool` | `False` | Retry all tasks by default. |
+| `no_result_on_retry` | `bool` | `True` | Replace the result with `NoResultError` while retrying. |
+| `default_delay` | `float` | `5` | Base delay in seconds before retrying. |
+| `use_jitter` | `bool` | `False` | Add a random sub-second offset to the delay to spread retries. |
+| `use_delay_exponent` | `bool` | `False` | Multiply the delay by the retry count (exponential backoff). |
+| `max_delay_exponent` | `float` | `60` | Cap on the computed delay when exponential backoff is enabled. |
+| `schedule_source` | `ScheduleSource \| None` | `None` | Use a schedule source for delayed retries instead of a broker-level delay label. |
+| `types_of_exceptions` | `Iterable[type[BaseException]] \| None` | `None` | Restrict retries to these exception types. |
+
+**Enabling retries on individual tasks:**
+
+```python
+@broker.task(retry_on_error=True, max_retries=10, delay=15)
+async def my_task() -> None:
+    raise Exception("Error, retrying!")
+```
+
+- `retry_on_error=True` — opt this task into retry behaviour.
+- `max_retries=10` — override the middleware default for this task.
+- `delay=15` — initial delay in seconds (overrides `default_delay`).
+
+**Delay calculation:**
+
+When `use_delay_exponent=True`, the effective delay for retry `n` is:
+
+```
+delay = min(base_delay * n, max_delay_exponent)
+```
+
+If `use_jitter=True`, a random value in `[0, 1)` is added after the exponent calculation.
+
+<Tip>
+Use jitter and exponential backoff together in high-load systems to prevent retry storms — bursts of simultaneous retries that can overload a recovering dependency.
+</Tip>
+
+---
+
+## PrometheusMiddleware
+
+`PrometheusMiddleware` starts an embedded HTTP server exposing Prometheus metrics scraped from task execution events. It tracks received tasks, successful completions, errors, result saves, and execution duration per task name.
+
+**Install the dependency:**
+
+<Tabs>
+  <Tab title="pip (prometheus_client only)">
+    ```bash
+    pip install prometheus_client
+    ```
+  </Tab>
+  <Tab title="pip (taskiq extras)">
+    ```bash
+    pip install "taskiq[metrics]"
+    ```
+  </Tab>
+</Tabs>
+
+```python
+from taskiq import ZeroMQBroker, PrometheusMiddleware
+
+broker = ZeroMQBroker().with_middlewares(
+    PrometheusMiddleware(server_addr="0.0.0.0", server_port=9000),
+)
+```
+
+**Constructor parameters:**
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `server_port` | `int` | `9000` | Port the metrics HTTP server listens on. |
+| `server_addr` | `str` | `"0.0.0.0"` | Address the metrics server binds to. |
+| `metrics_path` | `Path \| None` | `None` | Directory for multiprocess metric files. Defaults to a subdirectory of the system temp dir. |
+
+**Exposed metrics:**
+
+| Metric name | Type | Description |
+|---|---|---|
+| `received_tasks` | Counter | Tasks received by the worker, labelled by `task_name`. |
+| `success_tasks` | Counter | Tasks that completed without error. |
+| `found_errors` | Counter | Tasks that raised an exception. |
+| `saved_results` | Counter | Results written to the result backend. |
+| `execution_time` | Histogram | Wall-clock execution time in seconds. |
+
+The server only starts in worker processes. If multiple workers share the same host, each starts on the same port — only the first bind succeeds; subsequent ones log a debug message and skip.
+
+<Note>
+Any other Prometheus metrics your application registers will also appear on the `/metrics` endpoint because the middleware uses a shared `MultiProcessCollector` registry.
+</Note>
+
+---
+
+## TaskiqAdminMiddleware
+
+`TaskiqAdminMiddleware` reports task lifecycle events to an external admin HTTP API. It fires POST requests at three lifecycle points: when a task is queued (`post_send`), when it starts executing (`pre_execute`), and when it completes (`post_execute`).
+
+```python
+from taskiq.middlewares import TaskiqAdminMiddleware
+
+broker = MyBroker().with_middlewares(
+    TaskiqAdminMiddleware(
+        url="https://my-admin.example.com",
+        api_token="your-api-token",
+        timeout=5,
+        taskiq_broker_name="my-broker",
+    ),
+)
+```
+
+**Constructor parameters:**
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `url` | `str` | required | Base URL of the admin API. |
+| `api_token` | `str` | required | Bearer token sent in the `access-token` header. |
+| `timeout` | `int` | `5` | Request timeout in seconds. |
+| `taskiq_broker_name` | `str \| None` | `None` | Optional broker name included in the API payload. |
+
+Requests are dispatched as fire-and-forget background tasks. All pending requests are awaited during graceful broker shutdown so no events are dropped.
+
+---
+
+## OpenTelemetryMiddleware
+
+`OpenTelemetryMiddleware` instruments task execution with OpenTelemetry traces. The preferred approach is to use `TaskiqInstrumentor`, which automatically wraps the broker internals.
+
+**Install:**
+
+```bash
+pip install "taskiq[opentelemetry]"
+```
+
+<Tabs>
+  <Tab title="Instrumentor (recommended)">
+    ```python
+    from taskiq import ZeroMQBroker
+    from taskiq.instrumentation import TaskiqInstrumentor
+
+    TaskiqInstrumentor().instrument()
+    broker = ZeroMQBroker()
+    ```
+  </Tab>
+  <Tab title="Middleware (manual)">
+    ```python
+    from taskiq import ZeroMQBroker
+    from taskiq.middlewares.opentelemetry_middleware import OpenTelemetryMiddleware
+
+    broker = ZeroMQBroker().with_middlewares(
+        OpenTelemetryMiddleware,
+    )
+    ```
+  </Tab>
+</Tabs>
+
+Auto-instrumentation via the OpenTelemetry SDK (`opentelemetry-instrument`) is also supported.

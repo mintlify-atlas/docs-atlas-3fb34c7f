@@ -1,0 +1,203 @@
+---
+title: "Build a Custom Middleware for Taskiq"
+description: "Subclass TaskiqMiddleware to hook into the task lifecycle. Implement pre_send, post_send, pre_execute, on_error, post_execute, and post_save in sync or async."
+---
+
+Taskiq middlewares let you run arbitrary code at six points in the task lifecycle — from the moment a task is dispatched by the client, through execution in the worker, to result persistence. By subclassing `TaskiqMiddleware` from `taskiq.abc.middleware`, you can add logging, tracing, alerting, rate limiting, or any other cross-cutting concern without touching your task functions.
+
+## The `TaskiqMiddleware` class
+
+`TaskiqMiddleware` is not abstract — you only override the hooks you need. Every hook can be either sync or async; Taskiq detects which and awaits accordingly.
+
+Every middleware instance has a `self.broker` attribute set automatically when the middleware is registered. Use it to dispatch follow-up tasks, read broker state, or interact with the result backend from within a hook.
+
+## Hook execution order
+
+The hooks run in this sequence for a typical successful task:
+
+```
+client side:   pre_send  →  post_send
+worker side:   pre_execute  →  post_execute  →  post_save
+```
+
+If the task raises an exception, `on_error` fires between `post_execute` and `post_save`:
+
+```
+worker side:   pre_execute  →  post_execute  →  on_error  →  post_save
+```
+
+## All hook signatures
+
+<ParamField path="startup" type="sync or async method">
+  Called when the broker starts up. Use this to open connections or initialise state that the middleware needs.
+</ParamField>
+
+<ParamField path="shutdown" type="sync or async method">
+  Called when the broker shuts down. Use this to close connections opened in `startup()`.
+</ParamField>
+
+<ParamField path="pre_send" type="sync or async method">
+  **Client-side.** Receives the `TaskiqMessage` before it is serialised and sent to the broker. Must return the (optionally modified) message. Use this to inject labels, trace IDs, or modify arguments.
+</ParamField>
+
+<ParamField path="post_send" type="sync or async method">
+  **Client-side.** Receives the `TaskiqMessage` after it has been sent. Return value is ignored. Use this for audit logging or metrics.
+</ParamField>
+
+<ParamField path="pre_execute" type="sync or async method">
+  **Worker-side.** Receives the deserialized `TaskiqMessage` before the task function is called. Must return the (optionally modified) message. Use this for distributed tracing context propagation or argument validation.
+</ParamField>
+
+<ParamField path="post_execute" type="sync or async method">
+  **Worker-side.** Receives the `TaskiqMessage` and the `TaskiqResult` after the task function returns (whether it succeeded or failed). Return value is ignored.
+</ParamField>
+
+<ParamField path="on_error" type="sync or async method">
+  **Worker-side.** Receives the `TaskiqMessage`, the `TaskiqResult`, and the `BaseException` when a task raises. Return value is ignored. Called after `post_execute` and before `post_save`.
+</ParamField>
+
+<ParamField path="post_save" type="sync or async method">
+  **Worker-side.** Receives the `TaskiqMessage` and `TaskiqResult` after the result has been persisted to the result backend. Return value is ignored. Use this for notifications or cleanup.
+</ParamField>
+
+## Sync and async implementations
+
+Both sync and async hooks work. Use whichever fits your dependencies.
+
+<Tabs>
+  <Tab title="Sync">
+    ```python middleware_sync.py
+    from time import sleep
+    from typing import Any
+
+    from taskiq import TaskiqMessage, TaskiqMiddleware, TaskiqResult
+
+
+    class MyMiddleware(TaskiqMiddleware):
+        def startup(self) -> None:
+            print("RUN STARTUP")
+            sleep(1)
+
+        def shutdown(self) -> None:
+            print("RUN SHUTDOWN")
+            sleep(1)
+
+        def pre_execute(self, message: "TaskiqMessage") -> TaskiqMessage:
+            sleep(1)
+            return message
+
+        def post_save(
+            self,
+            message: "TaskiqMessage",
+            result: "TaskiqResult[Any]",
+        ) -> None:
+            sleep(1)
+            print("Post save")
+    ```
+  </Tab>
+  <Tab title="Async">
+    ```python middleware_async.py
+    from asyncio import sleep
+    from typing import Any
+
+    from taskiq import TaskiqMessage, TaskiqMiddleware, TaskiqResult
+
+
+    class MyMiddleware(TaskiqMiddleware):
+        async def startup(self) -> None:
+            print("RUN STARTUP")
+            await sleep(1)
+
+        async def shutdown(self) -> None:
+            print("RUN SHUTDOWN")
+            await sleep(1)
+
+        async def pre_execute(self, message: "TaskiqMessage") -> TaskiqMessage:
+            await sleep(1)
+            return message
+
+        async def post_save(
+            self,
+            message: "TaskiqMessage",
+            result: "TaskiqResult[Any]",
+        ) -> None:
+            await sleep(1)
+            print("Post save")
+    ```
+  </Tab>
+</Tabs>
+
+## Using `self.broker`
+
+The `broker` reference is injected when the middleware is added to a broker via `with_middlewares()` or `add_middlewares()`. From any hook, you can use it to dispatch new tasks:
+
+```python
+from typing import Any
+from taskiq import TaskiqMessage, TaskiqMiddleware, TaskiqResult
+
+
+class PipelineMiddleware(TaskiqMiddleware):
+    async def post_save(
+        self,
+        message: "TaskiqMessage",
+        result: "TaskiqResult[Any]",
+    ) -> None:
+        # Kick a follow-up task using the broker reference.
+        next_task_name = message.labels.get("next_task")
+        if next_task_name and not result.is_err:
+            task = self.broker.find_task(next_task_name)
+            if task:
+                await task.kiq(result.return_value)
+```
+
+<Note>
+  `self.broker` is `None` until the middleware is registered. Never access it in `__init__()`.
+</Note>
+
+## Error handling hook
+
+The `on_error` hook receives the live exception object, giving you access to the full stack trace:
+
+```python
+import logging
+from typing import Any
+from taskiq import TaskiqMessage, TaskiqMiddleware, TaskiqResult
+
+logger = logging.getLogger(__name__)
+
+
+class ErrorReportingMiddleware(TaskiqMiddleware):
+    def on_error(
+        self,
+        message: "TaskiqMessage",
+        result: "TaskiqResult[Any]",
+        exception: BaseException,
+    ) -> None:
+        logger.error(
+            "Task %s failed with %s: %s",
+            message.task_name,
+            type(exception).__name__,
+            exception,
+            exc_info=exception,
+        )
+```
+
+## Registering a middleware
+
+Attach middlewares to a broker using the fluent `with_middlewares()` method:
+
+```python
+broker = (
+    MyBroker()
+    .with_middlewares(
+        ErrorReportingMiddleware(),
+        PipelineMiddleware(),
+    )
+)
+```
+
+Middlewares execute in registration order. The first middleware in the list runs its hooks first.
+
+<Tip>
+  Taskiq Pipelines use middleware internally to chain tasks. If you are building pipeline-like functionality, look at the `taskiq-pipelines` package as a reference implementation.
+</Tip>

@@ -1,0 +1,435 @@
+---
+title: "Managing Shared State and Dependencies in taskiq"
+description: "Learn how to share resources across tasks with TaskiqState, handle broker lifecycle events, and build dependency injection trees with TaskiqDepends."
+---
+
+taskiq provides two complementary systems for passing resources into tasks at runtime: `TaskiqState` for storing broker-level shared objects, and `TaskiqDepends` for structured, type-safe dependency injection. Together they let you initialise connections once on startup and inject them cleanly into every task function.
+
+## State
+
+`TaskiqState` is a global store attached to the broker. You write to it during startup events and read from it inside tasks via the `Context` dependency.
+
+### Broker lifecycle events
+
+taskiq fires four events you can hook into:
+
+| Event | When it fires |
+|---|---|
+| `WORKER_STARTUP` | Worker process begins listening for tasks |
+| `WORKER_SHUTDOWN` | Worker process shuts down |
+| `CLIENT_STARTUP` | Application calls `broker.startup()` |
+| `CLIENT_SHUTDOWN` | Application calls `broker.shutdown()` |
+
+Use `@broker.on_event` to register handlers:
+
+<Tabs>
+  <Tab title="Python 3.10+ (Annotated)">
+    ```python
+    import asyncio
+    from typing import Annotated
+
+    from redis.asyncio import ConnectionPool, Redis
+    from taskiq_aio_pika import AioPikaBroker
+    from taskiq_redis import RedisAsyncResultBackend
+
+    from taskiq import Context, TaskiqDepends, TaskiqEvents, TaskiqState
+
+    broker = AioPikaBroker(
+        "amqp://localhost",
+    ).with_result_backend(RedisAsyncResultBackend("redis://localhost"))
+
+
+    @broker.on_event(TaskiqEvents.WORKER_STARTUP)
+    async def startup(state: TaskiqState) -> None:
+        # Store connection pool on startup for later use.
+        state.redis = ConnectionPool.from_url("redis://localhost/1")
+
+
+    @broker.on_event(TaskiqEvents.WORKER_SHUTDOWN)
+    async def shutdown(state: TaskiqState) -> None:
+        # Close pool on shutdown.
+        await state.redis.disconnect()
+
+
+    @broker.task
+    async def get_val(
+        key: str,
+        context: Annotated[Context, TaskiqDepends()],
+    ) -> str | None:
+        redis = Redis(connection_pool=context.state.redis, decode_responses=True)
+        return await redis.get(key)
+
+
+    @broker.task
+    async def set_val(
+        key: str,
+        value: str,
+        context: Annotated[Context, TaskiqDepends()],
+    ) -> None:
+        await Redis(connection_pool=context.state.redis).set(key, value)
+    ```
+  </Tab>
+  <Tab title="Default values">
+    ```python
+    import asyncio
+
+    from redis.asyncio import ConnectionPool, Redis
+    from taskiq_aio_pika import AioPikaBroker
+    from taskiq_redis import RedisAsyncResultBackend
+
+    from taskiq import Context, TaskiqDepends, TaskiqEvents, TaskiqState
+
+    broker = AioPikaBroker(
+        "amqp://localhost",
+    ).with_result_backend(RedisAsyncResultBackend("redis://localhost"))
+
+
+    @broker.on_event(TaskiqEvents.WORKER_STARTUP)
+    async def startup(state: TaskiqState) -> None:
+        state.redis = ConnectionPool.from_url("redis://localhost/1")
+
+
+    @broker.on_event(TaskiqEvents.WORKER_SHUTDOWN)
+    async def shutdown(state: TaskiqState) -> None:
+        await state.redis.disconnect()
+
+
+    @broker.task
+    async def get_val(key: str, context: Context = TaskiqDepends()) -> str | None:
+        redis = Redis(connection_pool=context.state.redis, decode_responses=True)
+        return await redis.get(key)
+
+
+    @broker.task
+    async def set_val(key: str, value: str, context: Context = TaskiqDepends()) -> None:
+        await Redis(connection_pool=context.state.redis).set(key, value)
+    ```
+  </Tab>
+</Tabs>
+
+<Tip>
+  To register handlers programmatically instead of with the decorator, call `broker.add_event_handler(event, handler)`.
+</Tip>
+
+---
+
+## Dependencies
+
+Accessing `context.state` directly works, but since `TaskiqState` is generic your IDE cannot autocomplete its fields. `TaskiqDepends` solves this by letting you declare typed dependency functions or classes that taskiq resolves automatically before each task runs. The implementation is similar to FastAPI's dependency injection and is powered by the [taskiq-dependencies](https://pypi.org/project/taskiq-dependencies/) package.
+
+### Function dependencies
+
+Wrap state access in a function and annotate its return type:
+
+<Tabs>
+  <Tab title="Python 3.10+ (Annotated)">
+    ```python
+    from typing import Annotated
+    from redis.asyncio import Redis
+    from taskiq import Context, TaskiqDepends
+
+    def redis_dep(context: Annotated[Context, TaskiqDepends()]) -> Redis:
+        return Redis(connection_pool=context.state.redis, decode_responses=True)
+
+    @broker.task
+    async def my_task(redis: Annotated[Redis, TaskiqDepends(redis_dep)]) -> None:
+        await redis.set("key", "value")
+    ```
+  </Tab>
+  <Tab title="Default values">
+    ```python
+    from redis.asyncio import Redis
+    from taskiq import Context, TaskiqDepends
+
+    def redis_dep(context: Context = TaskiqDepends()) -> Redis:
+        return Redis(connection_pool=context.state.redis, decode_responses=True)
+
+    @broker.task
+    async def my_task(redis: Redis = TaskiqDepends(redis_dep)) -> None:
+        await redis.set("key", "value")
+    ```
+  </Tab>
+</Tabs>
+
+### Dependency trees and caching
+
+Dependencies can depend on other dependencies. By default taskiq evaluates each dependency only once per task invocation and shares the result — so `common_dep` below is called once and both `dep1` and `dep2` receive the same value:
+
+<Tabs>
+  <Tab title="Python 3.10+ (Annotated)">
+    ```python
+    import random
+    from typing import Annotated
+    from taskiq import TaskiqDepends
+
+    def common_dep() -> int:
+        return random.randint(1, 10)  # returns e.g. 8
+
+    def dep1(cd: Annotated[int, TaskiqDepends(common_dep)]) -> int:
+        return cd + 1  # 9
+
+    def dep2(cd: Annotated[int, TaskiqDepends(common_dep)]) -> int:
+        return cd + 2  # 10
+
+    def my_task(
+        d1: Annotated[int, TaskiqDepends(dep1)],
+        d2: Annotated[int, TaskiqDepends(dep2)],
+    ) -> int:
+        return d1 + d2  # 19
+    ```
+  </Tab>
+  <Tab title="Default values">
+    ```python
+    import random
+    from taskiq import TaskiqDepends
+
+    def common_dep() -> int:
+        return random.randint(1, 10)
+
+    def dep1(cd: int = TaskiqDepends(common_dep)) -> int:
+        return cd + 1
+
+    def dep2(cd: int = TaskiqDepends(common_dep)) -> int:
+        return cd + 2
+
+    def my_task(
+        d1: int = TaskiqDepends(dep1),
+        d2: int = TaskiqDepends(dep2),
+    ) -> int:
+        return d1 + d2
+    ```
+  </Tab>
+</Tabs>
+
+To force a dependency to re-evaluate (bypassing the cache), pass `use_cache=False`:
+
+<Tabs>
+  <Tab title="Python 3.10+ (Annotated)">
+    ```python
+    import random
+    from typing import Annotated
+    from taskiq import TaskiqDepends
+
+    def common_dep() -> int:
+        return random.randint(1, 10)
+
+    def dep1(cd: Annotated[int, TaskiqDepends(common_dep)]) -> int:
+        return cd + 1
+
+    # dep2 gets a fresh evaluation of common_dep
+    def dep2(cd: Annotated[int, TaskiqDepends(common_dep, use_cache=False)]) -> int:
+        return cd + 2
+
+    def my_task(
+        d1: Annotated[int, TaskiqDepends(dep1)],
+        d2: Annotated[int, TaskiqDepends(dep2)],
+    ) -> int:
+        return d1 + d2
+    ```
+  </Tab>
+  <Tab title="Default values">
+    ```python
+    import random
+    from taskiq import TaskiqDepends
+
+    def common_dep() -> int:
+        return random.randint(1, 10)
+
+    def dep1(cd: int = TaskiqDepends(common_dep)) -> int:
+        return cd + 1
+
+    def dep2(cd: int = TaskiqDepends(common_dep, use_cache=False)) -> int:
+        return cd + 2
+
+    def my_task(
+        d1: int = TaskiqDepends(dep1),
+        d2: int = TaskiqDepends(dep2),
+    ) -> int:
+        return d1 + d2
+    ```
+  </Tab>
+</Tabs>
+
+### Class dependencies
+
+Classes work as dependencies too. When the type annotation matches the class itself you can omit the argument to `TaskiqDepends()`:
+
+<Tabs>
+  <Tab title="Python 3.10+ (Annotated)">
+    ```python
+    from typing import Annotated
+    from taskiq import TaskiqDepends
+
+    async def db_connection() -> str:
+        return "let's pretend as this is a connection"
+
+    class MyDAO:
+        def __init__(self, db_conn: Annotated[str, TaskiqDepends(db_connection)]) -> None:
+            self.db_conn = db_conn
+
+        def get_users(self) -> str:
+            return self.db_conn.upper()
+
+    def my_task(dao: Annotated[MyDAO, TaskiqDepends()]) -> None:
+        print(dao.get_users())
+    ```
+  </Tab>
+  <Tab title="Default values">
+    ```python
+    from taskiq import TaskiqDepends
+
+    async def db_connection() -> str:
+        return "let's pretend as this is a connection"
+
+    class MyDAO:
+        def __init__(self, db_conn: str = TaskiqDepends(db_connection)) -> None:
+            self.db_conn = db_conn
+
+        def get_users(self) -> str:
+            return self.db_conn.upper()
+
+    def my_task(dao: MyDAO = TaskiqDepends()) -> None:
+        print(dao.get_users())
+    ```
+  </Tab>
+</Tabs>
+
+<Note>
+  The shorthand `TaskiqDepends()` with no arguments only works when the dependency is a class. For plain functions you must pass the callable explicitly.
+</Note>
+
+### Generator dependencies
+
+Use a generator when you need setup and teardown logic around each task execution:
+
+<Tabs>
+  <Tab title="Python 3.10+ (Annotated)">
+    ```python
+    from collections.abc import Generator
+    from typing import Annotated
+    from taskiq import TaskiqDepends
+
+    def dependency() -> Generator[str, None, None]:
+        print("Startup")
+        yield "value"
+        print("Shutdown")
+
+    async def my_task(dep: Annotated[str, TaskiqDepends(dependency)]) -> None:
+        print(dep.upper())
+    ```
+  </Tab>
+  <Tab title="Default values">
+    ```python
+    from collections.abc import Generator
+    from taskiq import TaskiqDepends
+
+    def dependency() -> Generator[str, None, None]:
+        print("Startup")
+        yield "value"
+        print("Shutdown")
+
+    async def my_task(dep: str = TaskiqDepends(dependency)) -> None:
+        print(dep.upper())
+    ```
+  </Tab>
+</Tabs>
+
+For async teardown, convert to an async generator:
+
+<Tabs>
+  <Tab title="Python 3.10+ (Annotated)">
+    ```python
+    import asyncio
+    from collections.abc import AsyncGenerator
+    from typing import Annotated
+    from taskiq import TaskiqDepends
+
+    async def dependency() -> AsyncGenerator[str, None]:
+        print("Startup")
+        await asyncio.sleep(0.1)
+        yield "value"
+        await asyncio.sleep(0.1)
+        print("Shutdown")
+
+    async def my_task(dep: Annotated[str, TaskiqDepends(dependency)]) -> None:
+        print(dep.upper())
+    ```
+  </Tab>
+  <Tab title="Default values">
+    ```python
+    import asyncio
+    from collections.abc import AsyncGenerator
+    from taskiq import TaskiqDepends
+
+    async def dependency() -> AsyncGenerator[str, None]:
+        print("Startup")
+        await asyncio.sleep(0.1)
+        yield "value"
+        await asyncio.sleep(0.1)
+        print("Shutdown")
+
+    async def my_task(dep: str = TaskiqDepends(dependency)) -> None:
+        print(dep.upper())
+    ```
+  </Tab>
+</Tabs>
+
+#### Exception handling in generators
+
+Generator dependencies receive exceptions raised inside the task. This lets you implement transactional teardown:
+
+<Tabs>
+  <Tab title="Python 3.10+ (Annotated)">
+    ```python
+    from typing import Annotated
+
+    async def get_transaction(
+        db_driver: Annotated[DBDriver, TaskiqDepends(get_driver)],
+    ) -> AsyncGenerator[Transaction, None]:
+        trans = db_driver.begin_transaction()
+        try:
+            yield trans
+        except Exception:
+            await trans.rollback()
+            return
+        await trans.commit()
+    ```
+  </Tab>
+  <Tab title="Default values">
+    ```python
+    async def get_transaction(
+        db_driver: DBDriver = TaskiqDepends(get_driver),
+    ) -> AsyncGenerator[Transaction, None]:
+        trans = db_driver.begin_transaction()
+        try:
+            yield trans
+        except Exception:
+            await trans.rollback()
+            return
+        await trans.commit()
+    ```
+  </Tab>
+</Tabs>
+
+To suppress all exception propagation into generators, pass `--no-propagate-errors` to the worker:
+
+```bash
+taskiq worker my_file:broker --no-propagate-errors
+```
+
+---
+
+## Default and custom first-level dependencies
+
+By default taskiq resolves two first-level dependencies automatically:
+
+- `taskiq.context.Context` — the current execution context
+- `taskiq.state.TaskiqState` — the broker state object
+
+You can expand this list using `broker.add_dependency_context`, which accepts a mapping of types to values:
+
+```python
+broker.add_dependency_context({MyService: MyService(config)})
+```
+
+This is useful when writing libraries that need to inject their own dependencies into users' tasks, and is also the mechanism used to inject test doubles during testing.

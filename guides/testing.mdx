@@ -1,0 +1,251 @@
+---
+title: "Writing Tests for taskiq Tasks Without a Live Broker"
+description: "Use InMemoryBroker to test tasks as plain async functions, inject dependencies, await fire-and-forget tasks, and set up pytest fixtures for taskiq."
+---
+
+taskiq is designed to make testing straightforward. Because tasks are ordinary async functions under the hood, you can call them directly in tests, and `InMemoryBroker` provides the same interface as a production broker without requiring any network connections.
+
+## Setting up the test environment
+
+### Swap the broker with InMemoryBroker
+
+The standard pattern is to check an environment variable and replace the real broker with `InMemoryBroker` when running tests:
+
+```python
+# myapp/tkq.py
+import os
+
+from taskiq import AsyncBroker, InMemoryBroker, ZeroMQBroker
+
+env = os.environ.get("ENVIRONMENT")
+
+broker: AsyncBroker = ZeroMQBroker()
+
+if env and env == "pytest":
+    broker = InMemoryBroker()
+```
+
+Set the variable before running pytest:
+
+<Tabs>
+  <Tab title="Linux / macOS">
+    ```bash
+    export ENVIRONMENT="pytest"
+    pytest -vv
+    ```
+  </Tab>
+  <Tab title="Windows">
+    ```powershell
+    $env:ENVIRONMENT = 'pytest'
+    pytest -vv
+    ```
+  </Tab>
+  <Tab title="pytest.ini">
+    ```ini
+    [pytest]
+    env =
+        ENVIRONMENT=pytest
+    ```
+  </Tab>
+  <Tab title="pyproject.toml">
+    ```toml
+    [tool.pytest.ini_options]
+    env = [
+        "ENVIRONMENT=pytest",
+    ]
+    ```
+  </Tab>
+</Tabs>
+
+The `pytest.ini` / `pyproject.toml` approaches require the [pytest-env](https://pypi.org/project/pytest-env/) plugin.
+
+### Async test runner
+
+Since taskiq is fully asynchronous, use [anyio](https://anyio.readthedocs.io/en/stable/testing.html) to run async tests in pytest. Install it and add the following fixture to your root `conftest.py`:
+
+```python
+import pytest
+
+@pytest.fixture
+def anyio_backend():
+    return 'asyncio'
+```
+
+---
+
+## Testing task logic directly
+
+The simplest approach is to call the task function directly, as if it were a plain `async def`:
+
+```python
+from your_project.tasks import parse_int
+
+@pytest.mark.anyio
+async def test_task():
+    assert await parse_int("11") == 11
+```
+
+This skips the broker entirely and tests only the task's business logic.
+
+### Testing functions that call tasks
+
+When a function sends a task and waits for its result, `InMemoryBroker` handles everything in-process:
+
+```python
+# your_project/tasks.py
+from your_project.tkq import broker
+
+@broker.task
+async def parse_int(val: str) -> int:
+    return int(val)
+
+async def parse_and_add_one(val: str) -> int:
+    task = await parse_int.kiq(val)
+    result = await task.wait_result()
+    return result.return_value + 1
+```
+
+```python
+@pytest.mark.anyio
+async def test_add_one():
+    assert await parse_and_add_one("11") == 12
+```
+
+---
+
+## Fire-and-forget tasks
+
+When a function sends a task but never awaits the result, you need a way to ensure execution completes before asserting. `InMemoryBroker` offers two approaches:
+
+<Tabs>
+  <Tab title="await_inplace=True">
+    All tasks are executed immediately and synchronously at the point of `.kiq()`. This makes `await task.kiq()` behave identically to `await task()`.
+
+    ```python
+    broker = InMemoryBroker(await_inplace=True)
+    ```
+
+    ```python
+    @pytest.mark.anyio
+    async def test_fire_and_forget():
+        result = await parse_int_later("11")
+        assert result == 1
+        # Task has already run at this point
+    ```
+  </Tab>
+  <Tab title="wait_all()">
+    Tasks are queued normally. Call `broker.wait_all()` after triggering the function under test to drain all pending tasks before making assertions.
+
+    ```python
+    from your_project.tkq import broker
+
+    @pytest.mark.anyio
+    async def test_add_one():
+        assert await parse_int_later("11") == 1
+        await broker.wait_all()
+        # All sent tasks have now completed
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## Dependency injection in tests
+
+If your tasks use `TaskiqDepends`, you have two options:
+
+### Calling tasks directly
+
+Pass dependencies as regular function arguments:
+
+```python
+from pathlib import Path
+from your_project.tasks import modify_path
+
+@pytest.mark.anyio
+async def test_modify_path():
+    modified = await modify_path(Path.cwd())
+    assert str(modified).endswith("taskiq.py")
+```
+
+### Testing via the broker (kiq)
+
+To test full broker-mediated execution including dependency resolution, inject test values via `broker.add_dependency_context` before the test runs. The recommended pattern is an autouse fixture:
+
+```python
+import pytest
+from your_project.tkq import broker
+from pathlib import Path
+
+
+@pytest.fixture(scope="function", autouse=True)
+async def init_taskiq_dependencies():
+    broker.add_dependency_context({Path: Path.cwd()})
+
+    yield
+
+    # Clean up after each test
+    broker.custom_dependency_context = {}
+```
+
+With this fixture in place, tasks resolve `Path` to `Path.cwd()` automatically:
+
+```python
+from your_project.tasks import modify_path
+
+@pytest.mark.anyio
+async def test_modify_path():
+    task = await modify_path.kiq()
+    result = await task.wait_result()
+    assert str(result.return_value).endswith("taskiq.py")
+```
+
+<Tip>
+  The `scope="function"` on the fixture ensures each test starts with a clean dependency context, preventing state leakage between tests.
+</Tip>
+
+---
+
+## Full example: task with a Path dependency
+
+This end-to-end example shows a task definition, a broker setup, a dependency fixture, and a test:
+
+```python
+# your_project/tasks.py
+from pathlib import Path
+from taskiq import TaskiqDepends
+from your_project.tkq import broker
+
+@broker.task
+async def modify_path(some_path: Path = TaskiqDepends()):
+    return some_path.parent / "taskiq.py"
+```
+
+```python
+# tests/conftest.py
+import pytest
+from pathlib import Path
+from your_project.tkq import broker
+
+@pytest.fixture
+def anyio_backend():
+    return 'asyncio'
+
+@pytest.fixture(scope="function", autouse=True)
+async def init_taskiq_dependencies():
+    broker.add_dependency_context({Path: Path.cwd()})
+    yield
+    broker.custom_dependency_context = {}
+```
+
+```python
+# tests/test_tasks.py
+import pytest
+from your_project.tasks import modify_path
+
+@pytest.mark.anyio
+async def test_modify_path():
+    task = await modify_path.kiq()
+    result = await task.wait_result()
+    assert str(result.return_value).endswith("taskiq.py")
+```

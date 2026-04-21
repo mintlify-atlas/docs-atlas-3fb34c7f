@@ -1,0 +1,167 @@
+---
+title: "Using Taskiq with AioHTTP"
+description: "Share aiohttp application state and dependencies with taskiq background tasks using the taskiq-aiohttp integration and aiohttp-deps."
+---
+
+Taskiq provides a first-party integration for AioHTTP applications through two companion libraries: **aiohttp-deps** adds FastAPI-style dependency injection to AioHTTP handlers, and **taskiq-aiohttp** bridges that dependency system so the same dependencies — database pools, HTTP client sessions, and other shared resources — are available inside your taskiq tasks.
+
+## Installation
+
+<Steps>
+  <Step title="Install aiohttp-deps">
+    `aiohttp-deps` adds dependency injection to your AioHTTP handlers, mirroring FastAPI's `Depends` pattern.
+
+    ```bash
+    pip install "aiohttp-deps"
+    ```
+  </Step>
+
+  <Step title="Register the aiohttp-deps startup event">
+    Add `aiohttp_deps.init` to your application's startup sequence. This parses your handlers and builds dependency graphs for them.
+
+    ```python
+    from aiohttp import web
+    import aiohttp_deps
+
+    app = web.Application()
+
+    # Parses handlers and creates dependency graphs.
+    app.on_startup.append(aiohttp_deps.init)
+
+    web.run_app(app)
+    ```
+  </Step>
+
+  <Step title="Install taskiq-aiohttp">
+    ```bash
+    pip install "taskiq-aiohttp"
+    ```
+  </Step>
+
+  <Step title="Initialize the taskiq integration in your broker file">
+    Call `taskiq_aiohttp.init` with your broker and a dotted path to your `web.Application` variable (or a no-argument factory function that returns one — async factories are supported).
+
+    ```python
+    import taskiq_aiohttp
+
+    broker = MyBroker()
+
+    # Second argument: path to web.Application, or a factory function.
+    taskiq_aiohttp.init(broker, "my_project.main:app")
+    ```
+  </Step>
+</Steps>
+
+## Using application state in tasks
+
+After initialization, taskiq injects two aiohttp-specific dependencies into every task:
+
+| Dependency | Description |
+|---|---|
+| `web.Application` | The current application instance, including everything set on `app` during startup. |
+| `web.Request` | A mocked request. Exists only to allow dependencies written against `Request` to be resolved. |
+
+<Warning>
+  The `web.Application` injected into a task is a mock that carries the correct types and all state set during startup, but it does not handle real HTTP requests. Use it to access `app` state (pools, clients, settings) — not to interact with live connections.
+</Warning>
+
+Declare the dependency using `TaskiqDepends`:
+
+<Tabs>
+  <Tab title="Annotated (Python 3.10+)">
+    ```python
+    from aiohttp import web
+    from typing import Annotated
+    from taskiq import TaskiqDepends
+    from my_project.tkq import broker
+
+
+    @broker.task
+    async def my_task(app: Annotated[web.Application, TaskiqDepends()]):
+        db_pool = app["db_pool"]
+        async with db_pool.acquire() as conn:
+            await conn.execute("UPDATE ...")
+    ```
+  </Tab>
+  <Tab title="Default values">
+    ```python
+    from aiohttp import web
+    from taskiq import TaskiqDepends
+    from my_project.tkq import broker
+
+
+    @broker.task
+    async def my_task(app: web.Application = TaskiqDepends()):
+        db_pool = app["db_pool"]
+        async with db_pool.acquire() as conn:
+            await conn.execute("UPDATE ...")
+    ```
+  </Tab>
+</Tabs>
+
+Because the integration exposes the same application state that was populated during AioHTTP's startup, any connection pool or client session stored on `app` is available to your tasks without creating a second connection.
+
+## Testing
+
+When using `InMemoryBroker` in tests, you need to populate the broker's dependency context manually because the broker does not run as a worker process. Call `taskiq_aiohttp.populate_context` inside your `test_client` fixture after starting the server:
+
+```python
+import asyncio
+import taskiq_aiohttp
+import pytest
+from aiohttp.test_utils import TestClient, TestServer
+from aiohttp import web
+from typing import AsyncGenerator
+from my_project.tkq import broker
+
+
+@pytest.fixture
+async def test_client(
+    app: web.Application,
+) -> AsyncGenerator[TestClient, None]:
+    """
+    Create a test client.
+
+    This function creates a TestServer and a test client for the
+    application. It also populates the broker's dependency context
+    with the running application so InMemoryBroker tasks can resolve
+    aiohttp dependencies.
+
+    :param app: current application.
+    :yield: ready-to-use client.
+    """
+    loop = asyncio.get_running_loop()
+    server = TestServer(app)
+    client = TestClient(server, loop=loop)
+
+    await client.start_server()
+
+    # Populate the broker context so taskiq can resolve
+    # web.Application and web.Request dependencies in tasks.
+    taskiq_aiohttp.populate_context(
+        broker=broker,
+        server=server.runner.server,
+        app=app,
+        loop=loop,
+    )
+
+    yield client
+
+    broker.custom_dependency_context = {}
+    await client.close()
+```
+
+<Note>
+  Clear `broker.custom_dependency_context` after each test to prevent dependency state from leaking between test cases.
+</Note>
+
+## Further reading
+
+<CardGroup cols={2}>
+  <Card title="aiohttp-deps on GitHub" icon="github" href="https://github.com/taskiq-python/aiohttp-deps">
+    Source, documentation, and available dependency types for the injection library.
+  </Card>
+  <Card title="Full examples" icon="book-open" href="https://github.com/taskiq-python/examples">
+    Complete runnable projects demonstrating taskiq with AioHTTP.
+  </Card>
+</CardGroup>

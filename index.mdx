@@ -1,97 +1,112 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "Taskiq: Async Distributed Task Queue for Python"
+description: "Taskiq is an async-first Python task queue with a plugin-based broker system, FastAPI-style dependency injection, and a built-in cron scheduler."
 ---
 
-## Setting up
+Taskiq is an asynchronous distributed task queue framework for Python. It takes inspiration from Celery and Dramatiq but is built from the ground up for async workloads — with full support for `asyncio`, FastAPI-style dependency injection, pluggable brokers, and a built-in cron scheduler.
 
-Get your documentation site up and running in minutes.
-
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Get a working task queue running in under 5 minutes with InMemoryBroker or a real broker.
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Architecture Overview" icon="diagram-project" href="/architecture">
+    Understand brokers, kickers, result backends, middlewares, and how they fit together.
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="State & Dependencies" icon="layer-group" href="/guides/state-and-dependencies">
+    Use FastAPI-style dependency injection to share resources across your tasks.
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="Scheduling Tasks" icon="calendar-clock" href="/guides/scheduling">
+    Schedule tasks with cron expressions, intervals, or dynamic runtime scheduling.
   </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+## Why Taskiq?
 
-Everything you need to create world-class documentation.
+Taskiq is designed for modern Python applications that rely on `asyncio`. Unlike Celery, Taskiq runs both sync and async functions natively, integrates seamlessly with FastAPI and other async frameworks, and exposes a fully typed API.
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
+<CardGroup cols={3}>
+  <Card title="Fully Async" icon="bolt">
+    Built on asyncio from the ground up. Run async and sync tasks side by side.
   </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
+  <Card title="Pluggable Brokers" icon="plug">
+    Swap between Redis, RabbitMQ, NATS, ZeroMQ, and more without changing your task code.
   </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
+  <Card title="Dependency Injection" icon="syringe">
+    Inject shared resources like DB connections into tasks using `TaskiqDepends`.
   </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
+  <Card title="Built-in Scheduler" icon="clock">
+    Run cron jobs and interval tasks without an external scheduler process.
   </Card>
-</Columns>
+  <Card title="Middleware Hooks" icon="filter">
+    Execute code before/after every task with pre_send, pre_execute, and post_execute hooks.
+  </Card>
+  <Card title="Easy Testing" icon="flask">
+    Replace any broker with `InMemoryBroker` to test tasks as plain async functions.
+  </Card>
+</CardGroup>
 
-## Need inspiration?
+## Get started
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+<Steps>
+  <Step title="Install Taskiq">
+    Install the core library and choose a broker for your message queue backend.
+
+    ```bash
+    pip install taskiq
+    ```
+  </Step>
+  <Step title="Define your broker and tasks">
+    Create a broker instance and decorate functions with `@broker.task`.
+
+    ```python broker.py
+    from taskiq import InMemoryBroker
+
+    broker = InMemoryBroker()
+
+    @broker.task
+    async def add(a: int, b: int) -> int:
+        return a + b
+    ```
+  </Step>
+  <Step title="Send tasks">
+    Call `.kiq()` to send a task and `.wait_result()` to retrieve the result.
+
+    ```python main.py
+    import asyncio
+    from broker import broker, add
+
+    async def main():
+        await broker.startup()
+        task = await add.kiq(1, 2)
+        result = await task.wait_result()
+        print(result.return_value)  # 3
+        await broker.shutdown()
+
+    asyncio.run(main())
+    ```
+  </Step>
+  <Step title="Start a worker">
+    For distributed brokers, start a worker process to consume tasks.
+
+    ```bash
+    taskiq worker broker:broker
+    ```
+  </Step>
+</Steps>
+
+## Explore the documentation
+
+<CardGroup cols={2}>
+  <Card title="Framework Integrations" icon="puzzle-piece" href="/integrations/fastapi">
+    Connect Taskiq to FastAPI, AioHTTP, Aiogram, or FastStream to reuse your existing dependencies.
+  </Card>
+  <Card title="Available Components" icon="boxes-stacked" href="/components/brokers">
+    Browse officially supported brokers, result backends, schedule sources, and middlewares.
+  </Card>
+  <Card title="Testing Guide" icon="vial" href="/guides/testing">
+    Write tests for your tasks with InMemoryBroker and dependency context overrides.
+  </Card>
+  <Card title="Extending Taskiq" icon="wrench" href="/extending/overview">
+    Build custom brokers, result backends, middlewares, and serializers.
+  </Card>
+</CardGroup>

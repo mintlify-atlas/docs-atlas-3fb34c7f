@@ -1,0 +1,252 @@
+---
+title: "Using Middleware to Hook Into taskiq Task Execution"
+description: "Learn how taskiq middleware intercepts tasks at every lifecycle stage, from pre-send to post-save, and how to use built-in retry and metrics middlewares."
+---
+
+taskiq middleware lets you inject code at well-defined points in a task's lifecycle — before it is sent, during execution, and after results are saved. Any class that extends `TaskiqMiddleware` can override one or more hooks, and every hook can be either synchronous or asynchronous.
+
+## Lifecycle hooks
+
+The hooks fire in this order, split between the client (sender) side and the worker side:
+
+<Steps>
+  <Step title="pre_send (client-side)">
+    Called just before the message is dispatched to the broker. Returns the (potentially modified) `TaskiqMessage`. Use this to attach extra labels or mutate arguments before they leave the client.
+
+    ```python
+    def pre_send(self, message: TaskiqMessage) -> TaskiqMessage:
+        message.labels["source"] = "my-service"
+        return message
+    ```
+  </Step>
+  <Step title="post_send (client-side)">
+    Called right after the message has been sent to the broker. The return value is ignored. Use this for logging or metrics on the send side.
+
+    ```python
+    def post_send(self, message: TaskiqMessage) -> None:
+        print(f"Sent task {message.task_name}")
+    ```
+  </Step>
+  <Step title="pre_execute (worker-side)">
+    Called in the worker process before the task function runs. Returns the (potentially modified) `TaskiqMessage`. Use this for tracing, logging incoming tasks, or augmenting the message.
+
+    ```python
+    def pre_execute(self, message: TaskiqMessage) -> TaskiqMessage:
+        print(f"About to execute {message.task_name}")
+        return message
+    ```
+  </Step>
+  <Step title="post_execute (worker-side)">
+    Called after the task finishes (success or failure), before the result is saved. Receives the message and the result.
+
+    ```python
+    def post_execute(self, message: TaskiqMessage, result: TaskiqResult[Any]) -> None:
+        print(f"Execution time: {result.execution_time:.3f}s")
+    ```
+  </Step>
+  <Step title="on_error (worker-side)">
+    Called when the task raises an exception — after `post_execute` and before `post_save`. Receives the message, the result object (with `is_err=True`), and the exception itself. Use this to retry, alert, or record failures.
+
+    ```python
+    def on_error(
+        self,
+        message: TaskiqMessage,
+        result: TaskiqResult[Any],
+        exception: BaseException,
+    ) -> None:
+        print(f"Task {message.task_name} failed: {exception}")
+    ```
+  </Step>
+  <Step title="post_save (worker-side)">
+    Called after the result has been written to the result backend. Use this for metrics counters or any action that should only happen after persistence is confirmed.
+
+    ```python
+    def post_save(self, message: TaskiqMessage, result: TaskiqResult[Any]) -> None:
+        print("Result saved")
+    ```
+  </Step>
+</Steps>
+
+There are also `startup` and `shutdown` hooks that run when the broker starts and stops.
+
+---
+
+## Writing your own middleware
+
+<Tabs>
+  <Tab title="Synchronous">
+    ```python
+    from time import sleep
+    from typing import Any
+
+    from taskiq import TaskiqMessage, TaskiqMiddleware, TaskiqResult
+
+
+    class MyMiddleware(TaskiqMiddleware):
+        def startup(self) -> None:
+            print("RUN STARTUP")
+            sleep(1)
+
+        def shutdown(self) -> None:
+            print("RUN SHUTDOWN")
+            sleep(1)
+
+        def pre_execute(self, message: "TaskiqMessage") -> TaskiqMessage:
+            sleep(1)
+            return message
+
+        def post_save(self, message: "TaskiqMessage", result: "TaskiqResult[Any]") -> None:
+            sleep(1)
+            print("Post save")
+    ```
+  </Tab>
+  <Tab title="Asynchronous">
+    ```python
+    from asyncio import sleep
+    from typing import Any
+
+    from taskiq import TaskiqMessage, TaskiqMiddleware, TaskiqResult
+
+
+    class MyMiddleware(TaskiqMiddleware):
+        async def startup(self) -> None:
+            print("RUN STARTUP")
+            await sleep(1)
+
+        async def shutdown(self) -> None:
+            print("RUN SHUTDOWN")
+            await sleep(1)
+
+        async def pre_execute(self, message: "TaskiqMessage") -> TaskiqMessage:
+            await sleep(1)
+            return message
+
+        async def post_save(
+            self,
+            message: "TaskiqMessage",
+            result: "TaskiqResult[Any]",
+        ) -> None:
+            await sleep(1)
+            print("Post save")
+    ```
+  </Tab>
+</Tabs>
+
+### Accessing the broker from middleware
+
+Every middleware instance gets a `self.broker` reference set automatically after being registered. You can use it to kick new tasks from within a hook:
+
+```python
+class PipelineMiddleware(TaskiqMiddleware):
+    async def post_execute(
+        self,
+        message: TaskiqMessage,
+        result: TaskiqResult[Any],
+    ) -> None:
+        if not result.is_err:
+            # Kick a follow-up task using the broker reference
+            await next_step.kiq(result.return_value)
+```
+
+### Registering middleware
+
+Attach middleware to a broker using `.with_middlewares()`:
+
+```python
+broker = MyBroker().with_middlewares(
+    MyMiddleware(),
+    AnotherMiddleware(),
+)
+```
+
+---
+
+## Built-in middlewares
+
+taskiq ships with several ready-to-use middleware classes.
+
+<AccordionGroup>
+  <Accordion title="SimpleRetryMiddleware">
+    Retries failed tasks up to a configurable maximum. Enable retrying on a per-task basis via the `retry_on_error` label:
+
+    ```python
+    from taskiq.middlewares.simple_retry_middleware import SimpleRetryMiddleware
+
+    broker = MyBroker().with_middlewares(
+        SimpleRetryMiddleware(default_retry_count=3),
+    )
+
+    # Enable retry for a specific task
+    @broker.task(retry_on_error=True, max_retries=5)
+    async def unreliable_task() -> None:
+        ...
+    ```
+
+    **Constructor parameters:**
+
+    | Parameter | Default | Description |
+    |---|---|---|
+    | `default_retry_count` | `3` | Max retries when not overridden by label |
+    | `default_retry_label` | `False` | Whether to retry all tasks by default |
+    | `no_result_on_retry` | `True` | Replace result with `NoResultError` on retry |
+    | `types_of_exceptions` | `None` | Limit retries to specific exception types |
+  </Accordion>
+
+  <Accordion title="SmartRetryMiddleware">
+    Adds delays, jitter, and exponential backoff on top of the basic retry logic. Optionally integrates with a `ScheduleSource` to delay retries via the scheduler instead of using broker-level delay labels.
+
+    ```python
+    from taskiq.middlewares.smart_retry_middleware import SmartRetryMiddleware
+
+    broker = MyBroker().with_middlewares(
+        SmartRetryMiddleware(
+            default_retry_count=5,
+            default_delay=10,          # seconds
+            use_jitter=True,
+            use_delay_exponent=True,   # delay grows with each retry
+            max_delay_exponent=60,     # cap at 60 seconds
+        ),
+    )
+    ```
+
+    **Constructor parameters:**
+
+    | Parameter | Default | Description |
+    |---|---|---|
+    | `default_retry_count` | `3` | Max retries |
+    | `default_delay` | `5` | Base delay in seconds |
+    | `use_jitter` | `False` | Add random jitter to delay |
+    | `use_delay_exponent` | `False` | Apply exponential backoff |
+    | `max_delay_exponent` | `60` | Maximum delay cap when using backoff |
+    | `schedule_source` | `None` | `ScheduleSource` for delayed retry scheduling |
+    | `types_of_exceptions` | `None` | Limit retries to specific exception types |
+  </Accordion>
+
+  <Accordion title="PrometheusMiddleware">
+    Exposes a Prometheus metrics endpoint from each worker process. Tracks task counts, error counts, execution time histograms, and saved result counts — all labelled by task name.
+
+    ```python
+    from taskiq.middlewares.prometheus_middleware import PrometheusMiddleware
+
+    broker = MyBroker().with_middlewares(
+        PrometheusMiddleware(server_port=9000, server_addr="0.0.0.0"),
+    )
+    ```
+
+    Requires the `prometheus_client` package. Install via:
+
+    ```bash
+    pip install "taskiq[metrics]"
+    ```
+
+    **Metrics exposed:**
+
+    | Metric | Type | Description |
+    |---|---|---|
+    | `received_tasks` | Counter | Tasks received by the worker |
+    | `success_tasks` | Counter | Tasks that completed without error |
+    | `found_errors` | Counter | Tasks that raised an exception |
+    | `saved_results` | Counter | Results written to the result backend |
+    | `execution_time` | Histogram | Task function execution duration in seconds |
+  </Accordion>
+</AccordionGroup>

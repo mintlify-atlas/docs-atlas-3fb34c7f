@@ -1,0 +1,246 @@
+---
+title: "Scheduling Recurring and One-Off Tasks with taskiq"
+description: "Set up cron and time-based task schedules, run dynamic scheduling at runtime, handle timezones, and manage multiple schedule sources with TaskiqScheduler."
+---
+
+taskiq ships with a `TaskiqScheduler` that lets you send tasks on a fixed cadence without writing any polling loops. The scheduler reads from one or more schedule sources, compares each task's schedule against the current time, and kicks matching tasks to your broker — it does not execute tasks itself.
+
+## Defining a basic schedule
+
+Start with a task that has no schedule — just a regular broker task:
+
+```python
+from taskiq_aio_pika import AioPikaBroker
+
+broker = AioPikaBroker("amqp://guest:guest@localhost:5672/")
+
+@broker.task
+async def heavy_task(value: int) -> int:
+    return value + 1
+```
+
+To run `heavy_task` every 5 minutes, add a scheduler and a `schedule` label to the task:
+
+```python
+from taskiq_aio_pika import AioPikaBroker
+from taskiq import TaskiqScheduler
+from taskiq.schedule_sources import LabelScheduleSource
+
+broker = AioPikaBroker("amqp://guest:guest@localhost:5672/")
+
+scheduler = TaskiqScheduler(
+    broker=broker,
+    sources=[LabelScheduleSource(broker)],
+)
+
+@broker.task(schedule=[{"cron": "*/5 * * * *", "args": [1]}])
+async def heavy_task(value: int) -> int:
+    return value + 1
+```
+
+<Note>
+  `LabelScheduleSource` reads schedules defined directly in task labels. You must include it alongside any other sources when you want label-defined schedules to be picked up.
+</Note>
+
+### Running the scheduler
+
+Start the scheduler process with:
+
+```bash
+taskiq scheduler module:scheduler
+```
+
+For example, if the module above is saved as `myapp/broker.py`:
+
+```bash
+taskiq scheduler myapp.broker:scheduler myapp.module1 myapp.module2
+```
+
+The optional positional arguments after the scheduler path are additional modules to import (useful for registering tasks that live elsewhere).
+
+<Warning>
+  Run only **one** scheduler instance at a time. Multiple concurrent schedulers will send each due task N times, where N is the number of running instances.
+</Warning>
+
+---
+
+## Dynamic scheduling at runtime
+
+Static label-based schedules cover recurring tasks. For one-off or runtime-controlled schedules, use a schedule source that supports dynamic writes — taskiq recommends `ListRedisScheduleSource` from `taskiq-redis`.
+
+<Steps>
+  <Step title="Set up the broker, source, and scheduler">
+    ```python
+    from taskiq_redis import ListQueueBroker, ListRedisScheduleSource
+    from taskiq import TaskiqScheduler
+
+    broker = ListQueueBroker("redis://localhost:6379/0")
+    redis_source = ListRedisScheduleSource("redis://localhost:6379/0")
+    scheduler = TaskiqScheduler(broker, sources=[redis_source])
+
+    @broker.task
+    async def my_task(arg1: int, arg2: str) -> None:
+        print("Hello from my_task!", arg1, arg2)
+    ```
+  </Step>
+
+  <Step title="Schedule by time">
+    ```python
+    import datetime
+
+    await redis_source.startup()
+
+    await my_task.schedule_by_time(
+        redis_source,
+        # Use UTC time, or include tzinfo on the datetime.
+        datetime.datetime.now(datetime.UTC) + datetime.timedelta(minutes=1, seconds=5),
+        11,
+        arg2="arg2",
+    )
+    ```
+  </Step>
+
+  <Step title="Schedule by cron">
+    ```python
+    await my_task.schedule_by_cron(
+        redis_source,
+        "*/5 * * * *",
+        11,
+        arg2="arg2",
+    )
+    ```
+  </Step>
+
+  <Step title="Schedule by interval">
+    ```python
+    import datetime
+
+    await my_task.schedule_by_interval(
+        redis_source,
+        datetime.timedelta(seconds=5),
+        11,
+        arg2="arg2",
+    )
+    ```
+  </Step>
+</Steps>
+
+### Passing extra labels
+
+If you need to attach additional labels to a dynamically scheduled task, call the methods on a `Kicker` instance:
+
+```python
+schedule = (
+    await my_task.kicker()
+    .with_labels(label1="value")
+    .schedule_by_time(
+        redis_source,
+        datetime.datetime.now(datetime.UTC) + datetime.timedelta(seconds=10),
+        11,
+        arg2="arg2",
+    )
+)
+```
+
+### Cancelling a schedule
+
+Every `schedule_by_*` method returns a `CreatedSchedule` object with a unique `schedule_id`. Use it to remove the schedule:
+
+```python
+schedule = await my_task.schedule_by_time(
+    redis_source,
+    datetime.datetime.now(datetime.UTC) + datetime.timedelta(minutes=1, seconds=5),
+    11,
+    arg2="arg2",
+)
+
+# Remove it later
+await schedule.unschedule()
+
+# Or manually via the source
+await redis_source.delete_schedule(schedule.schedule_id)
+```
+
+You can also read the `schedule_id` from inside the task itself:
+
+```python
+from taskiq import Context, TaskiqDepends
+
+@broker.task
+async def my_task(context: Context = TaskiqDepends()) -> None:
+    schedule_id = context.message.labels.get("schedule_id")
+    print("Schedule ID:", schedule_id)
+```
+
+---
+
+## Multiple sources and merge functions
+
+`TaskiqScheduler` accepts a list of sources. When it collects tasks from each source it uses a **merge function** to combine them. Two built-in merge functions live in `taskiq.scheduler.merge_functions`:
+
+<AccordionGroup>
+  <Accordion title="preserve_all (default)">
+    Appends all tasks from every source, including duplicates.
+
+    ```python
+    from taskiq.scheduler.merge_functions import preserve_all
+
+    scheduler = TaskiqScheduler(
+        broker=broker,
+        sources=[source_a, source_b],
+    )
+    # preserve_all is the default; pass it explicitly only if you need to be explicit
+    ```
+  </Accordion>
+
+  <Accordion title="only_unique">
+    Adds a task from a later source only if it is not already present in the accumulated list.
+
+    ```python
+    from taskiq.scheduler.merge_functions import only_unique
+
+    scheduler = TaskiqScheduler(
+        broker=broker,
+        sources=[source_a, source_b],
+        merge_func=only_unique,
+    )
+    ```
+  </Accordion>
+</AccordionGroup>
+
+You can also supply your own merge function with the signature `(old_tasks, new_tasks) -> list[ScheduledTask]` for more complex logic such as filtering.
+
+---
+
+## Timezone handling
+
+The scheduler assumes naive datetimes are in UTC. To schedule a task at a specific wall-clock time in another timezone:
+
+- For `time`-based tasks: attach `tzinfo` to the `datetime` object.
+- For `cron`-based tasks: use the `cron_offset` field on `ScheduledTask`, which accepts either a timezone string (e.g. `"Europe/Berlin"`) or a `timedelta` instance.
+
+---
+
+## Skipping the first run
+
+By default, when the scheduler starts it immediately checks whether any tasks were due within the current minute and fires them. To wait until the next full minute boundary before executing anything, pass `--skip-first-run`:
+
+```bash
+taskiq scheduler module:scheduler --skip-first-run
+```
+
+This is useful when the scheduler restarts frequently and you want to avoid duplicate executions of tasks that already ran moments ago.
+
+---
+
+## Scheduler CLI reference
+
+| Flag | Description |
+|---|---|
+| `--app-dir` | Directory used to resolve module imports |
+| `--tasks-pattern` / `-tp` | Glob pattern for auto-discovered task files (default: `**/tasks.py`) |
+| `--fs-discover` / `-fsd` | Enable recursive file-system task discovery |
+| `--skip-first-run` | Skip executing tasks that are due at scheduler startup |
+| `--update-interval` | Seconds between schedule checks (default: first second of each minute) |
+| `--log-level` | Logging level (default: `INFO`) |
+| `--no-configure-logging` | Disable taskiq's default log configuration |

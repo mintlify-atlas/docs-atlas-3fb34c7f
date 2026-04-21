@@ -1,0 +1,241 @@
+---
+title: "Schedule sources for taskiq periodic tasks"
+description: "How taskiq schedule sources work, using LabelScheduleSource for decorator-based cron tasks, Redis and NATS dynamic sources, and running TaskiqScheduler."
+---
+
+A **schedule source** tells `TaskiqScheduler` which tasks to send and when. The scheduler calls `get_schedules()` on each source on every tick and dispatches any task whose trigger time has arrived. Sources can be static (reading schedules from task labels baked in at import time) or dynamic (reading from a remote store that can be mutated at runtime).
+
+## The ScheduleSource interface
+
+All schedule sources implement the abstract `ScheduleSource` base class from `taskiq.abc.schedule_source`:
+
+```python
+from taskiq.abc.schedule_source import ScheduleSource
+from taskiq.scheduler.scheduled_task import ScheduledTask
+
+class ScheduleSource:
+    async def startup(self) -> None: ...
+    async def shutdown(self) -> None: ...
+    async def get_schedules(self) -> list[ScheduledTask]: ...
+    async def add_schedule(self, schedule: ScheduledTask) -> None: ...
+    async def delete_schedule(self, schedule_id: str) -> None: ...
+    def pre_send(self, task: ScheduledTask) -> None: ...
+    def post_send(self, task: ScheduledTask) -> None: ...
+```
+
+`add_schedule()` and `delete_schedule()` raise `NotImplementedError` by default. Sources that support dynamic scheduling override them.
+
+---
+
+## Built-in sources
+
+### LabelScheduleSource
+
+`LabelScheduleSource` is included in the core `taskiq` package. It reads schedules from the `schedule` label on task decorators. On startup it scans every task registered on the broker and collects all schedule entries.
+
+**Install:**
+
+```bash
+pip install taskiq
+```
+
+**Import:**
+
+```python
+from taskiq.schedule_sources import LabelScheduleSource
+```
+
+#### Setting up the scheduler
+
+```python
+from taskiq.scheduler import TaskiqScheduler
+from taskiq.schedule_sources import LabelScheduleSource
+from taskiq import ZeroMQBroker
+
+broker = ZeroMQBroker()
+
+scheduler = TaskiqScheduler(
+    broker=broker,
+    sources=[LabelScheduleSource(broker)],
+)
+```
+
+#### Defining scheduled tasks with labels
+
+Attach a `schedule` label to a task. Each entry in the list must specify exactly one of `cron`, `interval`, or `time`.
+
+```python
+@broker.task(
+    schedule=[
+        {
+            "cron": "* * * * *",      # run every minute
+            "cron_offset": None,      # optional timezone offset
+            "args": [],               # positional args
+            "kwargs": {},             # keyword args
+            "labels": {},             # extra labels for this invocation
+            "schedule_id": "every_minute",  # stable ID; random UUID if omitted
+        }
+    ]
+)
+async def my_task() -> None:
+    ...
+```
+
+**Schedule entry fields:**
+
+| Field | Type | Description |
+|---|---|---|
+| `cron` | `str \| None` | Standard crontab expression (`"*/5 * * * *"`). |
+| `cron_offset` | `str \| timedelta \| None` | Timezone offset applied to cron evaluation. |
+| `interval` | `int \| timedelta \| None` | Repeat interval in seconds (minimum 1, no fractional seconds). |
+| `time` | `datetime \| None` | One-shot datetime to send the task. Removed from the schedule after firing. |
+| `args` | `list \| None` | Positional arguments passed to the task. |
+| `kwargs` | `dict \| None` | Keyword arguments passed to the task. |
+| `labels` | `dict \| None` | Additional labels added to the task message. |
+| `schedule_id` | `str \| None` | Stable identifier. A random UUID hex is generated if omitted. |
+
+**Cron example:**
+
+```python
+@broker.task(schedule=[{"cron": "0 9 * * 1-5"}])
+async def daily_report() -> None:
+    """Runs weekdays at 09:00."""
+    ...
+```
+
+**Interval example:**
+
+```python
+@broker.task(schedule=[{"interval": 60}])
+async def heartbeat() -> None:
+    """Runs every 60 seconds."""
+    ...
+```
+
+**One-shot time example:**
+
+```python
+import datetime
+
+@broker.task(
+    schedule=[
+        {
+            "time": datetime.datetime(2026, 1, 1, 0, 0, 0, tzinfo=datetime.timezone.utc),
+            "schedule_id": "new_year_2026",
+        }
+    ]
+)
+async def new_year_task() -> None:
+    ...
+```
+
+<Warning>
+`LabelScheduleSource` resolves all task labels at startup. Make sure every task module is imported before the scheduler process starts. Pass all module paths to the `taskiq scheduler` CLI command.
+</Warning>
+
+---
+
+## Official ecosystem sources
+
+These sources are maintained by the taskiq team and support dynamic schedule management at runtime.
+
+### RedisScheduleSource
+
+From the `taskiq-redis` package. Stores schedules in Redis and allows adding or deleting schedules without restarting the scheduler process.
+
+```bash
+pip install taskiq-redis
+```
+
+```python
+from taskiq_redis import RedisScheduleSource
+from taskiq import TaskiqScheduler, ZeroMQBroker
+
+broker = ZeroMQBroker()
+redis_source = RedisScheduleSource("redis://localhost:6379/0")
+
+scheduler = TaskiqScheduler(broker=broker, sources=[redis_source])
+```
+
+#### Adding a schedule dynamically
+
+```python
+from taskiq.scheduler.scheduled_task import ScheduledTask
+
+await redis_source.add_schedule(
+    ScheduledTask(
+        task_name="myapp.tasks.send_report",
+        labels={},
+        args=[],
+        kwargs={"report_id": 42},
+        cron="0 8 * * *",
+    )
+)
+```
+
+#### Deleting a schedule
+
+```python
+await redis_source.delete_schedule(schedule_id="my-schedule-id")
+```
+
+### NATSKeyValueScheduleSource
+
+From the `taskiq-nats` package. Stores schedules in a NATS Key-Value bucket. Does not use the `schedule` label on tasks; all schedules must be added programmatically via `add_schedule()`.
+
+```bash
+pip install taskiq-nats
+```
+
+```python
+from taskiq_nats import NATSKeyValueScheduleSource
+from taskiq.scheduler import TaskiqScheduler
+
+broker = ...
+
+scheduler = TaskiqScheduler(
+    broker=broker,
+    sources=[NATSKeyValueScheduleSource(broker)],
+)
+```
+
+---
+
+## Using multiple sources
+
+`TaskiqScheduler` accepts a list of sources. All sources are queried on every tick and their schedules are merged:
+
+```python
+from taskiq.scheduler import TaskiqScheduler
+from taskiq.schedule_sources import LabelScheduleSource
+from taskiq_redis import RedisScheduleSource
+
+scheduler = TaskiqScheduler(
+    broker=broker,
+    sources=[
+        LabelScheduleSource(broker),       # static, from decorators
+        RedisScheduleSource("redis://localhost:6379/0"),  # dynamic, from Redis
+    ],
+)
+```
+
+---
+
+## Third-party sources
+
+<AccordionGroup>
+  <Accordion title="PostgreSQL — taskiq-postgres">
+    Project link: [taskiq-postgres](https://github.com/danfimov/taskiq-postgres)
+
+    ```bash
+    pip install taskiq-postgres
+    ```
+  </Accordion>
+  <Accordion title="YDB — taskiq-ydb">
+    Project link: [taskiq-ydb](https://github.com/danfimov/taskiq-ydb)
+
+    ```bash
+    pip install taskiq-ydb
+    ```
+  </Accordion>
+</AccordionGroup>

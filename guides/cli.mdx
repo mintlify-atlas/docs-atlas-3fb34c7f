@@ -1,0 +1,224 @@
+---
+title: "Running Workers and Schedulers with the taskiq CLI"
+description: "Complete reference for taskiq worker and scheduler commands: auto-discovery, acknowledgement types, hot reload, graceful shutdown, and executor options."
+---
+
+taskiq ships with a `taskiq` CLI program that provides two core subcommands: `worker` for consuming tasks and `scheduler` for dispatching them on a schedule. Both commands accept a path to a Python object using module colon notation (e.g. `myapp.broker:broker`).
+
+## `taskiq worker`
+
+Start a worker process that listens for tasks on your broker:
+
+```bash
+taskiq worker mybroker:broker_var my_project.module1 my_project.module2
+```
+
+The first positional argument is the broker import path. Any additional arguments are module paths that will be imported to register tasks.
+
+---
+
+### Task auto-discovery
+
+Listing every task module explicitly becomes impractical in large projects. taskiq supports two auto-discovery options:
+
+<AccordionGroup>
+  <Accordion title="--tasks-pattern / -tp">
+    A glob pattern for files to import. The default is `**/tasks.py`, which recursively finds every `tasks.py` file from the current directory. Can be specified multiple times.
+
+    ```bash
+    taskiq worker myapp:broker -tp "**/tasks.py" -tp "**/jobs.py"
+    ```
+  </Accordion>
+  <Accordion title="--fs-discover / -fsd">
+    Enables file-system discovery using the pattern set by `--tasks-pattern`. Pair this with `-tp` to customise the search pattern.
+
+    ```bash
+    taskiq worker myapp:broker --fs-discover
+    taskiq worker myapp:broker -fsd -tp "**/tasks/*.py"
+    ```
+  </Accordion>
+</AccordionGroup>
+
+---
+
+### Acknowledgement types
+
+taskiq supports three acknowledgement strategies, controlled by `--ack-type`:
+
+| Value | When the message is acked |
+|---|---|
+| `when_received` | As soon as the worker picks up the message |
+| `when_executed` | After the task function returns |
+| `when_saved` | After the result is written to the result backend (default) |
+
+```bash
+taskiq worker --ack-type when_executed mybroker:broker
+```
+
+Choose `when_received` for maximum throughput (tasks may be lost if a worker crashes mid-execution). Use `when_saved` (the default) for strongest delivery guarantees.
+
+---
+
+### Synchronous functions
+
+taskiq is async-first but can run synchronous task functions in a thread or process pool. By default it uses a `ThreadPoolExecutor`.
+
+<Tabs>
+  <Tab title="ThreadPoolExecutor (default)">
+    Best for sync functions that do I/O (database calls, HTTP requests). The GIL is released during I/O waits so threads run concurrently.
+
+    ```bash
+    taskiq worker myapp:broker --max-threadpool-threads 20
+    ```
+  </Tab>
+  <Tab title="ProcessPoolExecutor">
+    Best for CPU-bound sync functions (model inference, image processing, number crunching). Each process has its own GIL.
+
+    ```bash
+    taskiq worker myapp:broker --use-process-pool --max-process-pool-processes 4
+    ```
+  </Tab>
+</Tabs>
+
+<Tip>
+  As a rule of thumb: use `ThreadPoolExecutor` for I/O-bound sync work and `ProcessPoolExecutor` for CPU-bound sync work.
+</Tip>
+
+---
+
+### Hot reload
+
+Restart workers automatically when source files change — useful during development:
+
+<Steps>
+  <Step title="Install the reload extra">
+    <Tabs>
+      <Tab title="pip">
+        ```bash
+        pip install "taskiq[reload]"
+        ```
+      </Tab>
+      <Tab title="poetry">
+        ```bash
+        poetry add taskiq -E reload
+        ```
+      </Tab>
+      <Tab title="uv">
+        ```bash
+        uv add taskiq[reload]
+        ```
+      </Tab>
+    </Tabs>
+  </Step>
+  <Step title="Start the worker with --reload">
+    ```bash
+    taskiq worker myapp:broker --reload
+    # Watch a specific directory
+    taskiq worker myapp:broker --reload --reload-dir ./myapp
+    ```
+
+    By default, taskiq respects `.gitignore` and skips reloading for ignored files. Disable this with `--do-not-use-gitignore`.
+  </Step>
+</Steps>
+
+---
+
+### Graceful and forced shutdowns
+
+**Graceful shutdown** (Unix only): send `SIGINT` (Ctrl+C) or `SIGKILL` to the main process. taskiq stops fetching new messages immediately but waits for all currently running tasks to finish.
+
+**Graceful reload**: send `SIGHUP` to reload workers with updated code without dropping in-flight tasks — useful for zero-downtime deployments:
+
+```bash
+taskiq worker my_module:broker
+kill -HUP <main pid>
+```
+
+**Force kill**: if you do not want to wait for tasks to complete, send the termination signal three times (configurable with `--hardkill-count`). You can also set a timeout:
+
+```bash
+taskiq worker myapp:broker --wait-tasks-timeout 30
+```
+
+---
+
+### Type casting
+
+taskiq automatically casts incoming arguments to the types declared in the task signature:
+
+```python
+async def task(val: int) -> int:
+    return val + 1
+```
+
+Calling `task.kiq("2")` returns `3` because `"2"` is cast to `int`. If casting fails, the original value is kept as-is. Pydantic models and dataclasses work as parameter types.
+
+To disable type casting entirely:
+
+```bash
+taskiq worker myapp:broker --no-parse
+```
+
+---
+
+### Full flag reference
+
+| Flag | Default | Description |
+|---|---|---|
+| `--workers` | `2` | Number of worker child processes |
+| `--app-dir` | `cwd` | Directory used for module imports |
+| `--tasks-pattern` / `-tp` | `**/tasks.py` | Glob pattern for task file auto-discovery |
+| `--fs-discover` / `-fsd` | off | Enable recursive file-system task discovery |
+| `--ack-type` | `when_saved` | Acknowledgement strategy (`when_received`, `when_executed`, `when_saved`) |
+| `--use-process-pool` | off | Use `ProcessPoolExecutor` for sync functions |
+| `--max-process-pool-processes` | — | Number of processes in the process pool |
+| `--max-threadpool-threads` | — | Maximum threads in the thread pool |
+| `--max-async-tasks` | — | Maximum concurrently running async tasks |
+| `--max-prefetch` | — | Number of tasks to prefetch before execution |
+| `--reload` / `-r` | off | Enable hot reload on file changes |
+| `--reload-dir` | — | Directory to watch (repeatable) |
+| `--do-not-use-gitignore` | off | Ignore `.gitignore` when watching files |
+| `--no-parse` | off | Disable automatic argument type casting |
+| `--no-propagate-errors` | off | Suppress exception propagation into generator dependencies |
+| `--log-level` | `INFO` | Logging level |
+| `--log-format` | — | Custom log format string |
+| `--no-configure-logging` | off | Disable taskiq's default logging setup |
+| `--wait-tasks-timeout` | — | Seconds to wait for tasks before hard shutdown |
+| `--hardkill-count` | `3` | Number of termination signals before forcing a kill |
+| `--shutdown-timeout` | `5` | Maximum seconds for broker graceful shutdown |
+| `--max-tasks-per-child` | — | Restart a worker process after this many tasks |
+| `--max-fails` | — | Maximum child process exit count |
+| `--receiver` | — | Python path to a custom receiver class |
+| `--receiver_arg` | — | Custom arguments for the receiver |
+
+---
+
+## `taskiq scheduler`
+
+Runs the scheduler process that reads from schedule sources and sends due tasks to the broker:
+
+```bash
+taskiq scheduler <path-to-scheduler> [optional-modules]...
+```
+
+Example:
+
+```bash
+taskiq scheduler my_project.broker:scheduler my_project.module1 my_project.module2
+```
+
+### Scheduler flag reference
+
+| Flag | Default | Description |
+|---|---|---|
+| `--app-dir` | `cwd` | Directory used for module imports |
+| `--tasks-pattern` / `-tp` | `**/tasks.py` | Glob pattern for auto-discovered task files |
+| `--fs-discover` / `-fsd` | off | Enable recursive file-system task discovery |
+| `--skip-first-run` | off | Skip tasks that are due at startup |
+| `--update-interval` | first second of each minute | Seconds between schedule checks |
+| `--log-level` | `INFO` | Logging level |
+| `--no-configure-logging` | off | Disable taskiq's default logging setup |
+
+<Warning>
+  Always run exactly one scheduler instance. Multiple instances will send each due task once per instance.
+</Warning>

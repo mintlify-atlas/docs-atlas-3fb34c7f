@@ -1,0 +1,84 @@
+---
+title: "Introduction to taskiq: Async Task Queue for Python"
+description: "taskiq is an async-native Python task queue with pluggable brokers, FastAPI-style dependency injection, and full type safety via PEP-612 ParamSpec."
+---
+
+taskiq is an asynchronous distributed task queue for Python, inspired by Celery and Dramatiq but built from the ground up around `asyncio`. Unlike its predecessors, taskiq can send and run both synchronous and asynchronous functions, ships with deep integrations for popular async frameworks like FastAPI and AioHTTP, and uses [PEP-612](https://peps.python.org/pep-0612/) parameter specification to give you accurate autocompletion and type checking throughout your task code.
+
+## Why taskiq?
+
+Most Python task queues treat async as an afterthought. taskiq treats it as the default. Every broker interface is async-native, dependency injection works through `asyncio`, and the worker process runs an event loop rather than spawning threads for each task.
+
+<CardGroup cols={2}>
+  <Card title="Async-first design" icon="bolt">
+    Brokers, result backends, middlewares, and worker processes are all built around `asyncio`. Sync functions are supported via `run_in_executor`.
+  </Card>
+  <Card title="Full type safety" icon="shield-check">
+    Uses PEP-612 `ParamSpec` so `.kiq()` calls carry the same parameter types as the original function. Catch mistakes at type-check time, not at runtime.
+  </Card>
+  <Card title="Framework integrations" icon="plug">
+    Share FastAPI or AioHTTP dependencies inside your tasks. Use the same database sessions, auth state, and service objects you already have in your web app.
+  </Card>
+  <Card title="Pluggable brokers and backends" icon="server">
+    Official broker packages for NATS, Redis, RabbitMQ (via aio-pika), and Kafka. Swap backends without touching your task code.
+  </Card>
+  <Card title="Middleware hooks" icon="layers">
+    Six lifecycle hooks — `pre_send`, `post_send`, `pre_execute`, `on_error`, `post_execute`, `post_save` — let you add logging, retries, metrics, and tracing without modifying tasks.
+  </Card>
+  <Card title="Built-in retry strategies" icon="rotate-ccw">
+    `SimpleRetryMiddleware` and `SmartRetryMiddleware` ship in the core package. No extra dependencies required for basic retry behavior.
+  </Card>
+</CardGroup>
+
+## How taskiq differs from Celery and Dramatiq
+
+| Feature | taskiq | Celery | Dramatiq |
+|---|---|---|---|
+| Native `async`/`await` support | Yes | Partial (requires gevent or threads) | No |
+| Type-safe `.kiq()` API | Yes (PEP-612) | No | No |
+| FastAPI dependency injection | Yes | No | No |
+| Broker abstraction | Pluggable | Pluggable | Pluggable |
+| Python version requirement | 3.10+ | 3.8+ | 3.8+ |
+| Result backend required | Optional | Optional | Optional |
+
+taskiq requires **Python 3.10 or later** because it uses `ParamSpec`, `TypeAlias`, and structural pattern matching features introduced in that version.
+
+## Core concepts at a glance
+
+taskiq has five building blocks. You only need to understand them at a high level to get started — the [architecture page](/architecture) goes into detail.
+
+- **Broker** — communicates with the external queue (Redis, RabbitMQ, NATS, etc.). You create one and register tasks against it.
+- **Kicker** — assembles the message and sends it. Calling `.kiq()` on a task is shorthand for `task.kicker().kiq(...)`.
+- **Result backend** — stores task results so the caller can retrieve them. Optional, but required if you need return values.
+- **Worker** — a separate process that listens for messages and executes tasks. Started via the `taskiq worker` CLI command.
+- **Middleware** — hooks that run before and after task send and execution. Used for retries, logging, metrics, and more.
+
+## Installation
+
+```bash
+pip install taskiq
+```
+
+taskiq is available on PyPI. The core package includes `InMemoryBroker` and `ZeroMQBroker` for local use. For production, install the broker package that matches your message queue:
+
+```bash
+# RabbitMQ
+pip install taskiq-aio-pika
+
+# Redis (broker + result backend)
+pip install taskiq-redis
+
+# NATS JetStream
+pip install taskiq-nats
+```
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="play" href="/quickstart">
+    Send your first task in under five minutes using InMemoryBroker, then graduate to a distributed RabbitMQ setup.
+  </Card>
+  <Card title="Architecture overview" icon="diagram-project" href="/architecture">
+    Understand how brokers, kickers, result backends, workers, and middlewares fit together before building something larger.
+  </Card>
+</CardGroup>

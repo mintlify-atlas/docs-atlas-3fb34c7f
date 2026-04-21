@@ -1,0 +1,213 @@
+---
+title: "Custom Serializers and Formatters in Taskiq"
+description: "Replace Taskiq's default JSON serializer with CBOR, MessagePack, orjson, or a custom format. Learn TaskiqSerializer, TaskiqFormatter, and when to use each."
+---
+
+By default, Taskiq serializes task payloads to JSON using Python's standard library. For high-throughput workloads, binary formats such as CBOR or MessagePack can significantly reduce payload size and serialization overhead. Taskiq ships with several built-in serializers and a clean `TaskiqSerializer` ABC that lets you plug in any encoding format.
+
+## `TaskiqSerializer` — the serialization ABC
+
+`TaskiqSerializer` from `taskiq.abc.serializer` requires two methods:
+
+<ParamField path="dumpb" type="method" required>
+  Encodes a Python value to `bytes` for transmission over the wire. Receives the raw value (dict, list, primitives) and must return `bytes`.
+</ParamField>
+
+<ParamField path="loadb" type="method" required>
+  Decodes `bytes` received from the wire back to a Python value.
+</ParamField>
+
+```python
+from abc import ABC, abstractmethod
+from typing import Any
+
+
+class TaskiqSerializer(ABC):
+    @abstractmethod
+    def dumpb(self, value: Any) -> bytes:
+        """
+        Encode value to bytes for sending through the wire.
+
+        :param value: value to encode.
+        :return: encoded value.
+        """
+
+    @abstractmethod
+    def loadb(self, value: bytes) -> Any:
+        """
+        Decode bytes received from the wire.
+
+        :param value: value to decode.
+        :return: decoded value.
+        """
+```
+
+## Built-in serializers
+
+Taskiq ships four serializers. All live in `taskiq.serializers`.
+
+<Tabs>
+  <Tab title="JSONSerializer (default)">
+    The default serializer. Uses Python's built-in `json` module. No extra dependencies required.
+
+    ```python
+    from taskiq.serializers.json_serializer import JSONSerializer
+
+    serializer = JSONSerializer(
+        default=None,      # Custom JSON encoder function
+        ensure_ascii=True, # Escape non-ASCII characters
+    )
+    ```
+
+    Suitable for most applications. Choose a binary format when payload size or throughput is a concern.
+  </Tab>
+  <Tab title="CBORSerializer">
+    Uses the `cbor2` library. CBOR is a binary format that natively supports `datetime`, `bytes`, and other types that require custom handling in JSON.
+
+    ```python
+    from taskiq.serializers.cbor_serializer import CBORSerializer
+
+    serializer = CBORSerializer(
+        datetime_as_timestamp=True,
+        date_as_datetime=True,
+        string_referencing=True,
+    )
+    ```
+
+    Install the dependency:
+
+    ```bash
+    pip install cbor2
+    ```
+  </Tab>
+  <Tab title="MSGPackSerializer">
+    Uses the `msgpack` library. MessagePack is a compact binary format well-suited to numeric-heavy payloads and high-throughput queues.
+
+    ```python
+    from taskiq.serializers.msgpack_serializer import MSGPackSerializer
+
+    serializer = MSGPackSerializer(
+        use_bin_type=True,  # Required for correct bytes handling
+        datetime=True,      # Native datetime support
+    )
+    ```
+
+    Install the dependency:
+
+    ```bash
+    pip install msgpack
+    ```
+  </Tab>
+  <Tab title="ORJSONSerializer">
+    Uses the `orjson` library. Produces JSON bytes but significantly faster than the standard library, with native support for `datetime`, `UUID`, `numpy`, and more.
+
+    ```python
+    from taskiq.serializers.orjson_serializer import ORJSONSerializer
+
+    serializer = ORJSONSerializer(
+        default=None,   # Custom encoder for unknown types
+        option=None,    # orjson option flags (e.g. orjson.OPT_NON_STR_KEYS)
+    )
+    ```
+
+    Install the dependency:
+
+    ```bash
+    pip install orjson
+    ```
+  </Tab>
+</Tabs>
+
+## Writing a custom serializer
+
+Subclass `TaskiqSerializer` and implement both methods:
+
+```python
+from typing import Any
+from taskiq.abc.serializer import TaskiqSerializer
+
+
+class PickleSerializer(TaskiqSerializer):
+    """Example serializer using pickle (for trusted, internal queues only)."""
+
+    import pickle
+
+    def dumpb(self, value: Any) -> bytes:
+        return self.pickle.dumps(value)
+
+    def loadb(self, value: bytes) -> Any:
+        return self.pickle.loads(value)
+```
+
+<Warning>
+  Never use `pickle` in a public-facing queue. Deserializing untrusted pickle data allows arbitrary code execution. The example above is for illustration only.
+</Warning>
+
+## Attaching a serializer to a broker
+
+Use `with_serializer()` on any broker:
+
+```python
+from taskiq_redis import ListQueueBroker
+from taskiq.serializers.msgpack_serializer import MSGPackSerializer
+
+broker = (
+    ListQueueBroker("redis://localhost")
+    .with_serializer(MSGPackSerializer())
+)
+```
+
+The serializer is used for all tasks registered on that broker. Workers must be configured with the same serializer, or deserialization will fail.
+
+<Note>
+  The serializer is part of the broker's configuration, not the individual task. All tasks on a broker share the same serializer.
+</Note>
+
+## `TaskiqFormatter` — message formatting
+
+While `TaskiqSerializer` handles encoding task arguments (the payload), `TaskiqFormatter` from `taskiq.abc.formatter` controls the overall message envelope — how a `TaskiqMessage` (with `task_id`, `task_name`, `labels`, `args`, `kwargs`) is converted to and from a `BrokerMessage` (the raw bytes the broker actually sends).
+
+```python
+from abc import ABC, abstractmethod
+from taskiq.message import BrokerMessage, TaskiqMessage
+
+
+class TaskiqFormatter(ABC):
+    @abstractmethod
+    def dumps(self, message: TaskiqMessage) -> BrokerMessage:
+        """
+        Convert a TaskiqMessage to a BrokerMessage.
+
+        :param message: message to send.
+        :return: message for brokers.
+        """
+
+    @abstractmethod
+    def loads(self, message: bytes) -> TaskiqMessage:
+        """
+        Parse raw broker bytes into a TaskiqMessage.
+
+        :param message: message to parse.
+        :return: parsed taskiq message.
+        """
+```
+
+### When to implement a custom formatter
+
+Most applications do not need a custom formatter. Use a custom formatter when:
+
+- You need to interoperate with an existing message schema that does not match Taskiq's default envelope format.
+- You are integrating with a legacy system that has its own task message structure.
+- You need to add envelope-level encryption or signing that wraps the entire message, not just the payload.
+
+The default `ProxyFormatter` delegates serialization to the broker's configured `TaskiqSerializer` and constructs the standard Taskiq envelope. Override it only when the envelope structure itself must change.
+
+Attach a custom formatter with `with_formatter()`:
+
+```python
+broker = MyBroker().with_formatter(MyCustomFormatter())
+```
+
+<Tip>
+  If you only need to change how task arguments are encoded, use a custom `TaskiqSerializer`. Only reach for a custom `TaskiqFormatter` when you need to change the message envelope structure itself.
+</Tip>

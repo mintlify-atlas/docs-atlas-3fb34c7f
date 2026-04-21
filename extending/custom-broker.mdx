@@ -1,0 +1,167 @@
+---
+title: "Build a Custom Broker for Taskiq"
+description: "Implement AsyncBroker to connect Taskiq to any message transport. Learn kick(), listen(), AckableMessage, and the delay and priority label conventions."
+---
+
+Taskiq ships with brokers for Redis, RabbitMQ, NATS, ZeroMQ, and more, but every infrastructure has unique requirements. By subclassing `AsyncBroker` from `taskiq.abc.broker`, you can connect Taskiq to any message queue, database, or pub/sub system while all existing task decorators, middleware hooks, and result backends continue to work unchanged.
+
+## The `AsyncBroker` abstract class
+
+`AsyncBroker` requires exactly two abstract methods:
+
+<ParamField path="kick" type="async method" required>
+  Sends a `BrokerMessage` to your queue backend. Called on the client side when a task is dispatched via `.kiq()`. You should send only `message.message` (the raw bytes), not the full `BrokerMessage` object.
+</ParamField>
+
+<ParamField path="listen" type="async generator" required>
+  Yields raw `bytes` or `AckableMessage` objects from the queue. Called in the worker process. The worker reads messages from this generator in a tight loop and dispatches them to the registered task functions.
+</ParamField>
+
+```python
+from abc import abstractmethod
+from collections.abc import AsyncGenerator
+from taskiq.abc.broker import AsyncBroker
+from taskiq.acks import AckableMessage
+from taskiq.message import BrokerMessage
+
+class AsyncBroker:
+    @abstractmethod
+    async def kick(self, message: BrokerMessage) -> None: ...
+
+    @abstractmethod
+    def listen(self) -> AsyncGenerator[bytes | AckableMessage, None]: ...
+```
+
+## `BrokerMessage` fields
+
+`BrokerMessage` is a Pydantic model passed to `kick()`. Use its fields to control delivery behaviour.
+
+| Field | Type | Description |
+|---|---|---|
+| `task_id` | `str` | Unique identifier for this task invocation |
+| `task_name` | `str` | Fully-qualified task name (`module:function`) |
+| `message` | `bytes` | Serialized task payload — send only this over the wire |
+| `labels` | `dict[str, Any]` | Arbitrary key/value metadata including `delay` and `priority` |
+
+<Warning>
+  Send only `message.message` (the raw bytes) to your transport, not the serialized `BrokerMessage` object itself. Sending the full object may result in encoding issues if the bytes are not UTF-8-compatible.
+</Warning>
+
+## Complete implementation template
+
+```python broker.py
+from collections.abc import AsyncGenerator
+
+from taskiq import AckableMessage, AsyncBroker, BrokerMessage
+
+
+class MyBroker(AsyncBroker):
+    def __init__(self) -> None:
+        # Always call super().__init__() to initialize middlewares,
+        # result_backend, serializer, formatter, and other fields.
+        super().__init__()
+
+    async def startup(self) -> None:
+        # Open connections, authenticate, declare queues, etc.
+        # Always call super().startup() — it fires WORKER_STARTUP /
+        # CLIENT_STARTUP events and starts the result backend.
+        return await super().startup()
+
+    async def shutdown(self) -> None:
+        # Close connections and release resources.
+        # Always call super().shutdown() to fire shutdown events.
+        return await super().shutdown()
+
+    async def kick(self, message: BrokerMessage) -> None:
+        # Publish message.message (bytes) to your transport.
+        # Use message.labels to apply routing, priority, or delay.
+        pass
+
+    async def listen(self) -> AsyncGenerator[bytes | AckableMessage, None]:
+        while True:
+            # Fetch the next message from your transport.
+            new_message: bytes = ...  # type: ignore
+            # Yield the raw bytes. The worker handles deserialization.
+            yield new_message
+```
+
+## Acknowledgement support
+
+If your message transport supports acknowledgements (marking a message as processed so it is not redelivered), yield `AckableMessage` instead of plain `bytes` from `listen()`. Taskiq calls `ack()` automatically after the task finishes executing.
+
+```python
+from taskiq import AckableMessage
+from collections.abc import AsyncGenerator
+
+async def listen(self) -> AsyncGenerator[bytes | AckableMessage, None]:
+    for message in self.my_channel:
+        yield AckableMessage(
+            data=message.bytes,
+            # ack must be a zero-argument callable (sync or async).
+            ack=message.ack,
+        )
+```
+
+`AckableMessage` has two fields:
+
+| Field | Type | Description |
+|---|---|---|
+| `data` | `bytes` | Raw serialized task payload |
+| `ack` | `Callable[[], None \| Awaitable[None]]` | Called by Taskiq once processing completes |
+
+<Tip>
+  Use `AckableMessage` with brokers that support at-least-once delivery guarantees (RabbitMQ, SQS, NATS JetStream). Without acknowledgement, a worker crash before saving the result will cause the message to be silently lost.
+</Tip>
+
+## Startup and shutdown
+
+`startup()` and `shutdown()` are called automatically by the CLI when the worker or client process starts and stops. Override them to manage connection lifecycle:
+
+<Steps>
+  <Step title="Open resources in startup()">
+    Establish database connections, declare queues, authenticate with external services, and then call `await super().startup()` to fire lifecycle events.
+  </Step>
+  <Step title="Release resources in shutdown()">
+    Close connections, flush buffers, and then call `await super().shutdown()` to fire shutdown events and shut down the result backend.
+  </Step>
+</Steps>
+
+## Broker conventions
+
+Taskiq defines two optional label conventions. Implementing them makes your broker compatible with the broader Taskiq ecosystem (schedulers, pipelines, third-party tooling):
+
+<Note>
+  These conventions are optional. Your broker still works correctly without them, but supporting them enables features like delayed execution and prioritized queues.
+</Note>
+
+**`delay` label** — If present, the value is a number (int or float) of seconds. The broker should delay delivery or execution of the message by that number of seconds.
+
+```python
+async def kick(self, message: BrokerMessage) -> None:
+    delay = message.labels.get("delay")
+    if delay:
+        await asyncio.sleep(delay)  # or use transport-native delay
+    await self.channel.publish(message.message)
+```
+
+**`priority` label** — If present, the value indicates relative priority. Higher values should be processed sooner.
+
+```python
+async def kick(self, message: BrokerMessage) -> None:
+    priority = message.labels.get("priority", 0)
+    await self.channel.publish(message.message, priority=priority)
+```
+
+## Attaching the broker to a result backend
+
+Use the fluent `with_result_backend()` method rather than passing the backend in the constructor (constructor-based injection is deprecated):
+
+```python
+from taskiq_redis import ListQueueBroker, RedisAsyncResultBackend
+
+broker = (
+    MyBroker()
+    .with_result_backend(RedisAsyncResultBackend("redis://localhost"))
+    .with_middlewares(MyLoggingMiddleware())
+)
+```

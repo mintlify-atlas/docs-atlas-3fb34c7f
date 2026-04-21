@@ -1,0 +1,256 @@
+---
+title: "Available brokers for taskiq task queues"
+description: "Overview of every broker taskiq ships with and the official ecosystem packages — InMemoryBroker, ZeroMQBroker, shared tasks, RabbitMQ, Redis, and NATS."
+---
+
+Taskiq uses a **broker** to transport task messages from the client process that enqueues work to the worker processes that execute it. The core library ships with two brokers for local use and a shared-task helper. Production deployments rely on the official ecosystem packages or community-maintained third-party packages.
+
+## Built-in brokers
+
+### InMemoryBroker
+
+`InMemoryBroker` is designed for local development and testing. It executes tasks in the same process and thread without any network transport. By default it pairs with `InmemoryResultBackend`, so results are immediately available after the task runs.
+
+```python
+from taskiq import InMemoryBroker
+
+broker = InMemoryBroker()
+
+@broker.task
+async def add(a: int, b: int) -> int:
+    return a + b
+```
+
+**Constructor parameters**
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `sync_tasks_pool_size` | `int` | `4` | Thread pool size for synchronous tasks. |
+| `max_stored_results` | `int` | `100` | Maximum results held in memory. `-1` disables the cap. |
+| `cast_types` | `bool` | `True` | Validate and coerce task argument types. |
+| `max_async_tasks` | `int` | `30` | Maximum concurrent async tasks. |
+| `propagate_exceptions` | `bool` | `True` | Re-raise exceptions after the task errors. |
+| `await_inplace` | `bool` | `False` | When `True`, `kiq()` awaits the task before returning. |
+
+#### Waiting for all background tasks
+
+By default `InMemoryBroker` schedules tasks as background `asyncio.Task` objects. Call `wait_all()` to block until every pending task finishes — useful in tests.
+
+```python
+import asyncio
+from taskiq import InMemoryBroker
+
+broker = InMemoryBroker()
+
+@broker.task
+async def process(value: int) -> int:
+    return value * 2
+
+async def main() -> None:
+    await broker.startup()
+    await process.kiq(1)
+    await process.kiq(2)
+    await broker.wait_all()   # all tasks have finished here
+    await broker.shutdown()
+
+asyncio.run(main())
+```
+
+#### await_inplace mode
+
+Set `await_inplace=True` to make every `kiq()` call await the task inline before returning. This simplifies sequential test logic at the cost of parallelism.
+
+```python
+from taskiq import InMemoryBroker
+
+broker = InMemoryBroker(await_inplace=True)
+
+@broker.task
+async def greet(name: str) -> str:
+    return f"Hello, {name}"
+
+async def main() -> None:
+    await broker.startup()
+    task = await greet.kiq("world")
+    result = await task.get_result()
+    print(result.return_value)   # Hello, world
+    await broker.shutdown()
+```
+
+<Note>
+`InMemoryBroker` raises a `RuntimeError` if you call `listen()` on it. Worker processes cannot be started with this broker — it is strictly for client-side execution.
+</Note>
+
+---
+
+### ZeroMQBroker
+
+`ZeroMQBroker` uses [ZeroMQ](https://zeromq.org/) PUB/SUB sockets to distribute messages. The client opens a PUB socket; workers connect as SUB subscribers. Because every subscriber receives every published message, you **must** run exactly one worker process.
+
+<Warning>
+Run taskiq with `-w 1` when using `ZeroMQBroker`. With multiple workers, every task is executed once per worker process, leading to duplicate execution.
+</Warning>
+
+**Install the dependency:**
+
+<Tabs>
+  <Tab title="pip (pyzmq only)">
+    ```bash
+    pip install pyzmq
+    ```
+  </Tab>
+  <Tab title="pip (taskiq extra)">
+    ```bash
+    pip install "taskiq[zmq]"
+    ```
+  </Tab>
+</Tabs>
+
+```python
+from taskiq import ZeroMQBroker
+
+broker = ZeroMQBroker(
+    zmq_pub_host="tcp://0.0.0.0:5555",   # client binds here
+    zmq_sub_host="tcp://localhost:5555",  # workers connect here
+)
+
+@broker.task
+async def send_email(to: str) -> None:
+    ...
+```
+
+**Constructor parameters**
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `zmq_pub_host` | `str` | `"tcp://0.0.0.0:5555"` | Address the client PUB socket binds to. |
+| `zmq_sub_host` | `str` | `"tcp://localhost:5555"` | Address worker SUB sockets connect to. |
+| `result_backend` | `AsyncResultBackend \| None` | `None` | Result backend to use. |
+| `task_id_generator` | `Callable[[], str] \| None` | `None` | Custom task ID factory. |
+
+---
+
+### Async shared broker and shared tasks
+
+`async_shared_broker` is a special singleton broker used to declare **shared tasks** — reusable tasks that live in a library and can be imported and executed by any application broker.
+
+You cannot call `kiq()` directly on a shared task without first providing a real broker. There are two ways to do this:
+
+<Tabs>
+  <Tab title="Set a default broker">
+    ```python
+    from taskiq.brokers.shared_broker import async_shared_broker
+    from taskiq import ZeroMQBroker
+
+    real_broker = ZeroMQBroker()
+    async_shared_broker.default_broker(real_broker)
+
+    # Now kiq() routes to real_broker automatically
+    await my_shared_task.kiq()
+    ```
+  </Tab>
+  <Tab title="Override per-kick with kicker">
+    ```python
+    from taskiq import ZeroMQBroker
+
+    real_broker = ZeroMQBroker()
+
+    await my_shared_task.kicker().with_broker(real_broker).kiq()
+    ```
+  </Tab>
+</Tabs>
+
+**Defining a shared task:**
+
+```python
+from taskiq.brokers.shared_broker import async_shared_broker
+
+@async_shared_broker.task
+def my_shared_task() -> bool:
+    return True
+```
+
+<Note>
+Shared tasks are registered in the global task registry (`broker.global_task_registry`), so any broker that imports the module can find them.
+</Note>
+
+---
+
+## Attaching a result backend
+
+Any broker can be paired with a result backend using `.with_result_backend()`. This returns the same broker instance with the backend configured.
+
+```python
+from taskiq import ZeroMQBroker
+from taskiq_redis import RedisAsyncResultBackend
+
+broker = ZeroMQBroker().with_result_backend(
+    RedisAsyncResultBackend("redis://localhost:6379/0"),
+)
+```
+
+---
+
+## Official ecosystem brokers
+
+These brokers are maintained by the taskiq team and published as separate packages.
+
+<CardGroup cols={3}>
+  <Card title="AioPikaBroker" icon="rabbit" href="https://github.com/taskiq-python/taskiq-aio-pika">
+    RabbitMQ broker using the aio-pika async AMQP client.
+  </Card>
+  <Card title="Redis broker" icon="database" href="https://github.com/taskiq-python/taskiq-redis">
+    Redis-backed broker using aioredis.
+  </Card>
+  <Card title="NATS broker" icon="bolt" href="https://github.com/taskiq-python/taskiq-nats">
+    NATS JetStream broker for high-throughput messaging.
+  </Card>
+</CardGroup>
+
+<Tabs>
+  <Tab title="RabbitMQ">
+    ```bash
+    pip install taskiq-aio-pika
+    ```
+  </Tab>
+  <Tab title="Redis">
+    ```bash
+    pip install taskiq-redis
+    ```
+  </Tab>
+  <Tab title="NATS">
+    ```bash
+    pip install taskiq-nats
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## Third-party brokers
+
+These brokers are maintained by community contributors.
+
+<AccordionGroup>
+  <Accordion title="PostgreSQL broker — taskiq-postgresql">
+    Project link: [taskiq-postgresql](https://github.com/z22092/taskiq-postgresql)
+
+    ```bash
+    pip install taskiq-postgresql
+    ```
+  </Accordion>
+  <Accordion title="SQS broker — taskiq-aio-sqs">
+    Project link: [taskiq-aio-sqs](https://github.com/vonsteer/taskiq-aio-sqs)
+
+    ```bash
+    pip install taskiq-aio-sqs
+    ```
+  </Accordion>
+  <Accordion title="YDB broker — taskiq-ydb">
+    Project link: [taskiq-ydb](https://github.com/danfimov/taskiq-ydb)
+
+    ```bash
+    pip install taskiq-ydb
+    ```
+  </Accordion>
+</AccordionGroup>

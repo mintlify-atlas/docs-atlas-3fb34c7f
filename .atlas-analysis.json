@@ -1,23 +1,11 @@
 {
-  "$schema": "https://mintlify.com/docs.json",
-  "name": "Taskiq",
+  "projectType": "framework",
+  "projectName": "Taskiq",
+  "projectDescription": "An async-first distributed task queue framework for Python with a plugin-based broker system, dependency injection, middleware, and built-in scheduler.",
   "theme": "palm",
-  "colors": {
-    "primary": "#94cb04",
-    "light": "#545454"
-  },
-  "favicon": "https://media.brand.dev/288cc7c4-5cef-4376-950b-bdf0083eedae.png",
-  "navbar": {
-    "primary": {
-      "type": "github",
-      "href": "https://github.com/taskiq-python/taskiq"
-    }
-  },
-  "footer": {
-    "socials": {
-      "github": "https://github.com/taskiq-python/taskiq"
-    }
-  },
+  "primaryColor": "#94cb04",
+  "lightColor": "#545454",
+  "darkColor": null,
   "navigation": {
     "tabs": [
       {
@@ -78,5 +66,43 @@
         ]
       }
     ]
-  }
+  },
+  "keyFeatures": [
+    "Full async/await support with asyncio",
+    "Plugin-based broker system (Redis, RabbitMQ, NATS, ZeroMQ, etc.)",
+    "FastAPI-style dependency injection for tasks",
+    "Built-in task scheduler with cron and interval support",
+    "Middleware hooks for pre/post task execution",
+    "InMemoryBroker for local development and testing",
+    "Hot-reload for workers during development",
+    "OpenTelemetry instrumentation support",
+    "Type-safe task definitions with PEP-612 ParamSpec",
+    "Multiple serialization formats (JSON, msgpack, cbor, orjson)"
+  ],
+  "publicApiSurface": [
+    "AsyncBroker",
+    "InMemoryBroker",
+    "ZeroMQBroker",
+    "async_shared_broker",
+    "AsyncResultBackend",
+    "TaskiqMiddleware",
+    "TaskiqScheduler",
+    "ScheduleSource",
+    "ScheduledTask",
+    "TaskiqDepends",
+    "Context",
+    "TaskiqState",
+    "TaskiqEvents",
+    "TaskiqResult",
+    "TaskiqMessage",
+    "BrokerMessage",
+    "AckableMessage",
+    "AsyncTaskiqTask",
+    "AsyncTaskiqDecoratedTask",
+    "TaskiqFormatter",
+    "SimpleRetryMiddleware",
+    "SmartRetryMiddleware",
+    "PrometheusMiddleware",
+    "gather"
+  ]
 }

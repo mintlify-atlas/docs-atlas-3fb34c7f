@@ -1,0 +1,357 @@
+---
+title: "taskiq Architecture: Brokers, Workers, and the Message Flow"
+description: "Understand how taskiq's five core components — Broker, Kicker, Result Backend, Worker, and Middleware — assemble into a distributed task pipeline."
+---
+
+taskiq is built around five distinct components that work together to move a function call from your application code to a worker process and back. This page explains what each component does, how they interact, and shows the real types and interfaces that tie everything together.
+
+## Message flow overview
+
+On the client side, your code calls `.kiq()` on a task. The `Kicker` assembles a `TaskiqMessage`, passes it through any registered middlewares, and hands it to the `Broker`, which serializes it and puts it on the external queue. On the worker side, the `Broker` receives the raw message, deserializes it, executes the task function, and stores the `TaskiqResult` in the result backend. Your client code can then retrieve the result.
+
+```
+Client side
+──────────────────────────────────────────
+Your code ──► Kicker (assemble message)
+               │
+               ▼
+             Broker ──► External Queue
+                              │
+Worker side                   │
+──────────────────────────────│───────────
+                              ▼
+                         Broker.listen()
+                              │
+                    Execute task function
+                              │
+                              ▼
+                       Result Backend
+──────────────────────────────────────────
+Your code ◄── Result Backend (fetch result)
+```
+
+<CardGroup cols={2}>
+  <Card title="Broker" icon="network-wired">
+    Communicates with the external queue. Must implement `kick` and `listen`. Every broker you use is a subclass of `AsyncBroker`.
+  </Card>
+  <Card title="Kicker" icon="paper-plane">
+    Assembles the `TaskiqMessage` with task name, args, kwargs, and labels. Calling `.kiq()` on a task creates a `Kicker` internally.
+  </Card>
+  <Card title="Result Backend" icon="database">
+    Stores and retrieves `TaskiqResult` objects. Optional — by default, brokers use `DummyResultBackend` which discards results.
+  </Card>
+  <Card title="Worker" icon="server">
+    A separate process that runs `broker.listen()` in an event loop and executes tasks as messages arrive. Started via the CLI.
+  </Card>
+  <Card title="Middleware" icon="layers">
+    Hooks into six points in the message lifecycle. Used for retries, logging, metrics, and modifying messages before they are sent.
+  </Card>
+  <Card title="Context" icon="brackets-curly">
+    Injected into tasks via dependency injection. Provides access to the broker instance, the raw message, and flow control (`requeue`, `reject`).
+  </Card>
+</CardGroup>
+
+---
+
+## Broker
+
+Every broker must subclass `AsyncBroker` from `taskiq.abc.broker` and implement two abstract methods:
+
+- **`kick(message: BrokerMessage)`** — serializes and sends a message to the external queue (e.g., `PUBLISH` in Redis, `basic_publish` in RabbitMQ).
+- **`listen()`** — an async generator with an infinite loop that yields raw messages from the external queue for the worker to process.
+
+```python
+from taskiq.abc.broker import AsyncBroker
+from taskiq.message import BrokerMessage
+from taskiq.acks import AckableMessage
+
+class MyBroker(AsyncBroker):
+    async def kick(self, message: BrokerMessage) -> None:
+        # Send serialized message bytes to external queue
+        ...
+
+    async def listen(self):
+        # Yield bytes or AckableMessage from external queue
+        ...
+```
+
+The broker also manages:
+
+- **Task registry** — `broker.local_task_registry` maps task names to `AsyncTaskiqDecoratedTask` objects. A global `AsyncBroker.global_task_registry` is shared across all broker instances.
+- **Middlewares** — `broker.add_middlewares(*middlewares)` or the fluent `broker.with_middlewares(*middlewares)`.
+- **Result backend** — set with `broker.with_result_backend(backend)`.
+- **Event handlers** — called at startup/shutdown on both the client and worker side.
+- **State** — `broker.state` is a `TaskiqState` object shared across event handlers and middlewares.
+
+```python
+from taskiq import InMemoryBroker, SimpleRetryMiddleware
+
+broker = (
+    InMemoryBroker()
+    .with_middlewares(SimpleRetryMiddleware(default_retry_count=3))
+)
+```
+
+<Note>
+`InMemoryBroker` and `ZeroMQBroker` are included in the core `taskiq` package. All other brokers (Redis, RabbitMQ, NATS, Kafka) are separate packages available on PyPI.
+</Note>
+
+---
+
+## Kicker
+
+`AsyncKicker` is the object that builds and dispatches a task message. You typically never instantiate it directly — calling `.kiq()` on a decorated task does it for you. But you can access the kicker explicitly to override labels, the broker, or the task ID before sending.
+
+```python
+from taskiq.brokers.inmemory_broker import InMemoryBroker
+
+broker = InMemoryBroker()
+second_broker = InMemoryBroker()
+
+
+@broker.task
+async def my_async_task() -> None:
+    """My lovely task."""
+    import asyncio
+    await asyncio.sleep(1)
+    print("Hello")
+
+
+async def main():
+    # This task was initially assigned to broker,
+    # but this time it is going to be sent using
+    # the second broker with additional label `delay=1`.
+    task = await my_async_task.kicker().with_broker(second_broker).with_labels(delay=1).kiq()
+    print(await task.get_result())
+```
+
+The kicker's `_prepare_message()` method serializes arguments, applying `model_dump()` to Pydantic models and `asdict()` to dataclasses automatically. The assembled message is a `TaskiqMessage`:
+
+```python
+TaskiqMessage(
+    task_id=task_id,       # UUID hex string by default
+    task_name=task_name,   # e.g. "mymodule:add_one"
+    labels=labels,         # dict of label name -> value
+    labels_types=...,      # type metadata for labels
+    args=formatted_args,
+    kwargs=formatted_kwargs,
+)
+```
+
+`.kiq()` returns an `AsyncTaskiqTask[ReturnType]` that you use to poll for or wait on the result.
+
+---
+
+## Messages and labels
+
+Every task message carries **labels** — arbitrary key-value metadata attached at definition time via the decorator or at send time via the kicker. Labels are used by the broker, middlewares, and workers to control behavior (timeouts, retry counts, routing keys, etc.).
+
+<Tabs>
+  <Tab title="Labels on the decorator">
+    ```python
+    @broker.task(timeout=5, my_label="something")
+    async def my_async_task() -> None:
+        await asyncio.sleep(1)
+        print("Hello")
+    ```
+  </Tab>
+  <Tab title="Labels via kicker">
+    ```python
+    @broker.task
+    async def my_async_task() -> None:
+        await asyncio.sleep(1)
+        print("Hello")
+
+    async def main():
+        await my_async_task.kicker().with_labels(
+            timeout=5,
+            my_label="something",
+        ).kiq()
+    ```
+  </Tab>
+</Tabs>
+
+Both approaches are equivalent. You can also assign a custom task name using `task_name=` on the decorator, which is useful for ensuring uniqueness across modules or for broker-level message routing:
+
+```python
+@broker.task(task_name="my_tasks.add_one", priority=1)
+async def add_one(value: int) -> int:
+    return value + 1
+```
+
+---
+
+## Result backend
+
+The result backend stores `TaskiqResult` objects after task execution. `TaskiqResult` is a Pydantic model with these fields:
+
+| Field | Type | Description |
+|---|---|---|
+| `is_err` | `bool` | `True` if the task raised an exception |
+| `return_value` | `_ReturnType` | The value returned by the task function |
+| `execution_time` | `float` | How long the task took to execute, in seconds |
+| `error` | `BaseException \| None` | The exception object if `is_err` is `True` |
+| `labels` | `dict[str, Any]` | Labels that were attached to the message |
+| `log` | `str \| None` | Deprecated log capture field |
+
+`TaskiqResult` also exposes a `.raise_for_error()` method that re-raises the stored exception if one occurred, analogous to `requests.Response.raise_for_status()`.
+
+Every result backend must subclass `AsyncResultBackend` from `taskiq.abc.result_backend`. The default `DummyResultBackend` discards all results — use it only when you don't need return values. `InMemoryBroker` uses `InMemoryResultBackend` by default, which is why the quickstart example can read results without a separate backend.
+
+Attach a real result backend using `.with_result_backend()`:
+
+```python
+from taskiq_aio_pika import AioPikaBroker
+from taskiq_redis import RedisAsyncResultBackend
+
+broker = AioPikaBroker(
+    "amqp://guest:guest@localhost:5672",
+).with_result_backend(RedisAsyncResultBackend("redis://localhost"))
+```
+
+---
+
+## Workers
+
+The `taskiq worker` CLI command starts one or more worker processes. Each process calls `broker.startup()`, enters the `broker.listen()` loop, and executes tasks as messages arrive.
+
+```bash
+# Point at module_path:broker_variable
+taskiq worker myproject.broker:broker
+
+# Import task modules manually
+taskiq worker myproject.broker:broker myproject.tasks myproject.jobs
+
+# Auto-discover all tasks.py files recursively
+taskiq worker myproject.broker:broker --fs-discover
+```
+
+For a project structured like this:
+
+```
+test_project/
+├── broker.py
+├── submodule/
+│   └── tasks.py
+└── utils/
+    └── tasks.py
+```
+
+`--fs-discover` (or `-fsd`) will import both `submodule/tasks.py` and `utils/tasks.py` automatically.
+
+<Info>
+By default, taskiq starts two worker processes. Use `--workers N` to control the number. If `uvloop` is installed, taskiq will automatically use it for the event loop.
+</Info>
+
+---
+
+## Middleware
+
+Middlewares intercept the task lifecycle at six points. Implement any combination of these methods by subclassing `TaskiqMiddleware`:
+
+| Hook | Side | When it runs |
+|---|---|---|
+| `pre_send` | Client | Before the message is sent. Can modify the message. |
+| `post_send` | Client | Immediately after the message is sent. |
+| `pre_execute` | Worker | After the message is received, before task execution. |
+| `on_error` | Worker | After task execution if an exception was raised. |
+| `post_execute` | Worker | After task execution (with or without error). |
+| `post_save` | Worker | After the result is saved to the result backend. |
+
+Every hook can be sync or async — taskiq handles both automatically.
+
+```python
+import asyncio
+
+from taskiq.abc.middleware import TaskiqMiddleware
+from taskiq.message import TaskiqMessage
+
+
+class MyMiddleware(TaskiqMiddleware):
+    async def pre_send(self, message: "TaskiqMessage") -> TaskiqMessage:
+        await asyncio.sleep(1)
+        message.labels["my_label"] = "my_value"
+        return message
+
+    def post_send(self, message: "TaskiqMessage") -> None:
+        print(f"Message {message} was sent.")
+```
+
+Middlewares can store state in `message.labels` for downstream hooks. For example, `SimpleRetryMiddleware` tracks the number of failed attempts this way.
+
+<Warning>
+Exceptions raised inside middleware hooks are not caught by taskiq. Always wrap edge cases in `try`/`except` within your middleware methods.
+</Warning>
+
+The core package ships two ready-to-use middlewares:
+
+- **`SimpleRetryMiddleware`** — retries failed tasks a fixed number of times.
+- **`SmartRetryMiddleware`** — retries with configurable backoff and per-exception-type policies.
+- **`PrometheusMiddleware`** — exports task execution metrics in Prometheus format.
+
+---
+
+## Context
+
+`Context` is injected into task functions via taskiq's dependency injection system (built on `taskiq-dependencies`). It gives you access to the broker instance, the raw `TaskiqMessage`, and flow control methods.
+
+<Tabs>
+  <Tab title="Python 3.10+ (Annotated)">
+    ```python
+    from typing import Annotated
+
+    from taskiq import Context, TaskiqDepends, InMemoryBroker
+
+    broker = InMemoryBroker()
+
+
+    @broker.task
+    async def my_task(context: Annotated[Context, TaskiqDepends()]) -> None:
+        # Access the broker that is executing this task
+        print(type(context.broker))
+        # Access the raw message
+        print(context.message.task_id)
+    ```
+  </Tab>
+  <Tab title="Default values syntax">
+    ```python
+    from taskiq import Context, TaskiqDepends, InMemoryBroker
+
+    broker = InMemoryBroker()
+
+
+    @broker.task
+    async def my_task(context: Context = TaskiqDepends()) -> None:
+        print(type(context.broker))
+        print(context.message.task_id)
+    ```
+  </Tab>
+</Tabs>
+
+You can also use context to requeue or reject a task, which stops further execution and either puts the message back on the queue or discards it:
+
+```python
+from typing import Annotated
+
+from taskiq import Context, TaskiqDepends, InMemoryBroker
+
+broker = InMemoryBroker()
+
+
+@broker.task
+async def conditional_task(
+    value: int,
+    context: Annotated[Context, TaskiqDepends()],
+) -> int:
+    if value < 0:
+        # Drop the message — do not retry
+        await context.reject()
+    if value > 1000:
+        # Put back on the queue — retry later
+        await context.requeue()
+    return value * 2
+```
+
+<Tip>
+`TaskiqDepends` follows the same pattern as FastAPI's `Depends`. You can build your own injectable dependencies that resolve against the broker's `custom_dependency_context`, making it easy to share database sessions or config objects between web handlers and background tasks.
+</Tip>

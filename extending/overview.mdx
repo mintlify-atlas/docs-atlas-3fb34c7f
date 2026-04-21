@@ -1,0 +1,104 @@
+---
+title: "Extending Taskiq: Plugins and Extension Points"
+description: "Taskiq exposes ABCs for every core component. Build custom brokers, result backends, middlewares, schedule sources, and serializers for any infrastructure."
+---
+
+Taskiq is designed to be fully extensible. Every core subsystem — brokers, result backends, middlewares, schedule sources, serializers, and formatters — is backed by an abstract base class (ABC) that you can subclass to integrate with any infrastructure, database, or message queue. All ABCs live in the `taskiq.abc` package.
+
+## Extension points
+
+<CardGroup cols={2}>
+  <Card title="Custom broker" icon="plug" href="/extending/custom-broker">
+    Connect Taskiq to any message queue by implementing `kick()` and `listen()` on `AsyncBroker`.
+  </Card>
+  <Card title="Custom result backend" icon="database" href="/extending/custom-result-backend">
+    Store and retrieve task results anywhere by implementing `AsyncResultBackend`.
+  </Card>
+  <Card title="Custom middleware" icon="filter" href="/extending/custom-middleware">
+    Hook into the task lifecycle at six points — before send, after send, before execute, on error, after execute, and after save.
+  </Card>
+  <Card title="Custom schedule source" icon="calendar" href="/extending/custom-schedule-source">
+    Feed scheduled tasks from any data source by implementing `ScheduleSource`.
+  </Card>
+  <Card title="Custom serializer" icon="brackets-curly" href="/extending/custom-serializer">
+    Replace the default JSON serializer with CBOR, MessagePack, orjson, or a fully custom format.
+  </Card>
+</CardGroup>
+
+## Plugin architecture philosophy
+
+Taskiq follows a composition-over-configuration approach. You assemble a broker by attaching independent components — a result backend, middlewares, a serializer, and a formatter — rather than choosing a monolithic implementation.
+
+```python
+from taskiq_redis import ListQueueBroker
+from taskiq_redis import RedisAsyncResultBackend
+
+broker = (
+    ListQueueBroker("redis://localhost")
+    .with_result_backend(RedisAsyncResultBackend("redis://localhost"))
+    .with_middlewares(MyLoggingMiddleware())
+    .with_serializer(CBORSerializer())
+)
+```
+
+Each component is independently swappable. A broker written for Redis can be used with a PostgreSQL result backend and a custom middleware without any changes to task code.
+
+## The `taskiq.abc` package
+
+Every extension point is importable from `taskiq.abc`:
+
+| Class | Path | Purpose |
+|---|---|---|
+| `AsyncBroker` | `taskiq.abc.broker` | Send and receive task messages |
+| `AsyncResultBackend` | `taskiq.abc.result_backend` | Store task results |
+| `TaskiqMiddleware` | `taskiq.abc.middleware` | Hook into task lifecycle events |
+| `ScheduleSource` | `taskiq.abc.schedule_source` | Provide scheduled task definitions |
+| `TaskiqSerializer` | `taskiq.abc.serializer` | Encode and decode message payloads |
+| `TaskiqFormatter` | `taskiq.abc.formatter` | Convert between `TaskiqMessage` and `BrokerMessage` |
+| `TaskiqCMD` | `taskiq.abc.cmd` | Add subcommands to the `taskiq` CLI |
+
+## Adding CLI subcommands
+
+Taskiq's CLI is itself an extension point. All built-in subcommands (`worker`, `scheduler`) use the same mechanism available to third-party packages.
+
+Create a class that implements `taskiq.abc.cmd.TaskiqCMD`, then register it as a `taskiq_cli` entry point in your package manifest:
+
+<Tabs>
+  <Tab title="pyproject.toml (setuptools)">
+    ```toml
+    [project.entry-points.taskiq_cli]
+    mycommand = "my_package.cmd:MyCommand"
+    ```
+  </Tab>
+  <Tab title="pyproject.toml (Poetry)">
+    ```toml
+    [tool.poetry.plugins.taskiq_cli]
+    mycommand = "my_package.cmd:MyCommand"
+    ```
+  </Tab>
+  <Tab title="setup.py">
+    ```python
+    setup(
+        entry_points={
+            "taskiq_cli": [
+                "mycommand = my_package.cmd:MyCommand",
+            ]
+        }
+    )
+    ```
+  </Tab>
+</Tabs>
+
+After installing the package, the subcommand becomes available immediately:
+
+```bash
+taskiq mycommand --help
+```
+
+<Tip>
+  The entry point name becomes the subcommand name. Use short, verb-like names (`inspect`, `purge`, `migrate`) to keep the CLI predictable.
+</Tip>
+
+## Publishing a plugin
+
+If you build a reusable extension, the community convention is to publish it as a standalone package on PyPI with a name prefixed by `taskiq-` (for example, `taskiq-redis`, `taskiq-aio-pika`). Register the appropriate entry points so installation is all users need to do.
